@@ -21,6 +21,9 @@ Variabili d'ambiente
   ORDERS_SINCE            data ISO: considera solo gli ordini Shopify da questa data (default: oggi)
   ONLY_SINGLES            "true" = sincronizza solo le carte singole (default true)
   CACHE_FILE              file cache dei blueprint (default .cache/blueprints.json)
+  MAX_CREATE              massimo di carte nuove create per giro (default 300)
+  HD_IMAGES               "true" = immagini HD da Scryfall per le carte Magic (default true)
+  MAX_IMAGE_UPDATES       massimo di prodotti esistenti a cui cambiare immagine per giro (default 300)
 """
 
 import json
@@ -38,6 +41,8 @@ CT_BASE = "https://api.cardtrader.com/api/v2"
 SHOPIFY_API_VERSION = "2026-10"
 SYNC_TAG = "cardtrader"
 ORDER_DONE_TAG = "ct-synced"
+HD_TAG = "img-hd"
+SCRYFALL_API = "https://api.scryfall.com"
 SKU_PREFIX = "CT-"
 
 CONDITION_SHORT = {
@@ -168,6 +173,49 @@ class CardTrader:
         return self.post(f"/products/{product_id}/increment", {"delta_quantity": int(delta)})
 
 
+class Scryfall:
+    """Immagini HD delle carte Magic (scryfall.com). Max ~10 richieste/s come da loro linee guida."""
+
+    def __init__(self):
+        self._last = 0.0
+        self._lock = threading.Lock()
+
+    def _throttle(self):
+        with self._lock:
+            wait = self._last + 0.15 - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.time()
+
+    @staticmethod
+    def images_of(card):
+        """URL delle immagini PNG (745x1040) di una carta; 2 per le carte a doppia faccia."""
+        if (card.get("image_uris") or {}).get("png"):
+            return [card["image_uris"]["png"]]
+        out = []
+        for face in card.get("card_faces") or []:
+            u = (face.get("image_uris") or {}).get("png")
+            if u:
+                out.append(u)
+        return out
+
+    def collection(self, ids):
+        """Mappa scryfall_id -> [url immagini] per una lista di id (75 per richiesta)."""
+        out = {}
+        ids = list(ids)
+        for i in range(0, len(ids), 75):
+            chunk = ids[i:i + 75]
+            self._throttle()
+            d = http_json("POST", SCRYFALL_API + "/cards/collection", None,
+                          {"identifiers": [{"id": x} for x in chunk]})
+            for c in d.get("data") or []:
+                out[c["id"]] = self.images_of(c)
+            for nf in d.get("not_found") or []:
+                if nf.get("id"):
+                    out[nf["id"]] = []
+        return out
+
+
 def as_list(x):
     if isinstance(x, list):
         return x
@@ -244,7 +292,8 @@ class Shopify:
           products(first: 100, after: $after, query: "tag:%s") {
             pageInfo { hasNextPage endCursor }
             nodes {
-              id title status
+              id title status tags
+              media(first: 10) { nodes { id } }
               variants(first: 1) { nodes {
                 id sku price
                 inventoryItem { id inventoryLevel(locationId: $loc) { quantities(names: ["available"]) { quantity } } }
@@ -272,6 +321,8 @@ class Shopify:
                     "product_id": p["id"],
                     "status": p["status"],
                     "title": p["title"],
+                    "tags": p.get("tags") or [],
+                    "media_ids": [m["id"] for m in (p.get("media") or {}).get("nodes") or []],
                     "variant_id": v["id"],
                     "price": float(v["price"]),
                     "inventory_item_id": (v.get("inventoryItem") or {}).get("id"),
@@ -330,8 +381,8 @@ class Shopify:
             "productOptions": [{"name": "Title", "values": [{"name": "Default Title"}]}],
             "variants": [variant],
         }
-        if item.get("image"):
-            inp["files"] = [{"originalSource": item["image"], "contentType": "IMAGE", "alt": item["title"]}]
+        if item.get("images"):
+            inp["files"] = [{"originalSource": u, "contentType": "IMAGE", "alt": item["title"]} for u in item["images"]]
         d = self.gql(
             """mutation($input: ProductSetInput!) {
                  productSet(input: $input, synchronous: true) {
@@ -362,6 +413,29 @@ class Shopify:
         )
         if d["productVariantsBulkUpdate"]["userErrors"]:
             raise RuntimeError(f"prezzo: {d['productVariantsBulkUpdate']['userErrors']}")
+
+    def replace_images(self, product_id, old_media_ids, urls, alt):
+        """Aggiunge le nuove immagini, poi cancella le vecchie e segna il prodotto come HD."""
+        d = self.gql(
+            """mutation($p: ProductUpdateInput!, $m: [CreateMediaInput!]) {
+                 productUpdate(product: $p, media: $m) { userErrors { field message } } }""",
+            {"p": {"id": product_id}, "m": [{"originalSource": u, "mediaContentType": "IMAGE", "alt": alt} for u in urls]},
+        )
+        if d["productUpdate"]["userErrors"]:
+            raise RuntimeError(f"immagini: {d['productUpdate']['userErrors']}")
+        if old_media_ids:
+            d = self.gql(
+                "mutation($ids: [ID!]!) { fileDelete(fileIds: $ids) { userErrors { field message } } }",
+                {"ids": old_media_ids},
+            )
+            if d["fileDelete"]["userErrors"]:
+                log(f"  ! vecchie immagini non cancellate: {d['fileDelete']['userErrors']}")
+        d = self.gql(
+            "mutation($id: ID!, $tags: [String!]!) { tagsAdd(id: $id, tags: $tags) { userErrors { message } } }",
+            {"id": product_id, "tags": [HD_TAG]},
+        )
+        if d["tagsAdd"]["userErrors"]:
+            raise RuntimeError(f"tagsAdd: {d['tagsAdd']['userErrors']}")
 
     def set_quantity(self, inventory_item_id, location_id, qty, current):
         q = {"inventoryItemId": inventory_item_id, "locationId": location_id, "quantity": int(qty)}
@@ -423,7 +497,7 @@ class BlueprintCache:
     def __init__(self, path, ct):
         self.path = path
         self.ct = ct
-        self.data = {"blueprints": {}, "expansions": {}}
+        self.data = {"blueprints": {}, "expansions": {}, "scryfall": {}}
         if path and os.path.exists(path):
             try:
                 with open(path, encoding="utf-8") as f:
@@ -432,6 +506,7 @@ class BlueprintCache:
                 pass
         self.data.setdefault("blueprints", {})
         self.data.setdefault("expansions", {})
+        self.data.setdefault("scryfall", {})
         self._loaded_exp = set()
         self._lock = threading.Lock()
 
@@ -439,7 +514,8 @@ class BlueprintCache:
         if not self.path:
             return
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        snapshot = {"blueprints": self.data["blueprints"].copy(), "expansions": self.data["expansions"].copy()}
+        snapshot = {"blueprints": self.data["blueprints"].copy(), "expansions": self.data["expansions"].copy(),
+                    "scryfall": self.data["scryfall"].copy()}
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(snapshot, f)
 
@@ -462,6 +538,7 @@ class BlueprintCache:
                 "expansion_id": b.get("expansion_id"),
                 "game_id": b.get("game_id"),
                 "image": img or None,
+                "scryfall_id": b.get("scryfall_id") or "",
             }
 
     def prefetch(self, blueprint_ids):
@@ -481,6 +558,35 @@ class BlueprintCache:
         with ThreadPoolExecutor(max_workers=8) as ex:
             list(ex.map(work, missing))
         log(f"  Schede recuperate: {len(missing)}")
+
+    def refresh_scryfall_ids(self, blueprint_ids):
+        """I blueprint salvati prima dell'aggiornamento non hanno lo scryfall_id: ricarico le loro espansioni."""
+        exps = set()
+        for b in blueprint_ids:
+            bp = self.data["blueprints"].get(str(b))
+            if bp and "scryfall_id" not in bp and bp.get("expansion_id"):
+                exps.add(bp["expansion_id"])
+        if not exps:
+            return
+        log(f"  Recupero gli ID Scryfall da {len(exps)} espansioni (solo la prima volta)…")
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(self._load_expansion_blueprints, sorted(exps)))
+
+    def scryfall_images(self, scryfall, blueprint_ids):
+        """Mappa scryfall_id -> [url HD], scaricando da Scryfall solo quelli non in cache."""
+        sids = set()
+        for b in blueprint_ids:
+            sid = (self.data["blueprints"].get(str(b)) or {}).get("scryfall_id")
+            if sid:
+                sids.add(sid)
+        missing = sorted(s for s in sids if s not in self.data["scryfall"])
+        if missing:
+            log(f"Scryfall: cerco le immagini HD di {len(missing)} carte…")
+            try:
+                self.data["scryfall"].update(scryfall.collection(missing))
+            except Exception as e:
+                log(f"  ! Scryfall non raggiungibile ({e}): per ora tengo le immagini CardTrader")
+        return self.data["scryfall"]
 
     def get(self, blueprint_id):
         key = str(blueprint_id)
@@ -507,7 +613,7 @@ class BlueprintCache:
         return self.data["blueprints"].get(key)
 
 
-def build_items(ct, cache, markup, min_price, only_singles):
+def build_items(ct, cache, markup, min_price, only_singles, scryfall=None):
     games = {g["id"]: (g.get("display_name") or g.get("name")) for g in as_list(ct.games())}
     single_cats = set()
     try:
@@ -522,7 +628,12 @@ def build_items(ct, cache, markup, min_price, only_singles):
     products = as_list(ct.products())
     log(f"CardTrader: {len(products)} articoli in totale")
     wanted = [p for p in products if not only_singles or p.get("category_id") in single_cats]
-    cache.prefetch(p.get("blueprint_id") for p in wanted if int(p.get("quantity") or 0) > 0)
+    live_bps = [p.get("blueprint_id") for p in wanted if int(p.get("quantity") or 0) > 0]
+    cache.prefetch(live_bps)
+    hd = {}
+    if scryfall is not None:
+        cache.refresh_scryfall_ids(live_bps)
+        hd = cache.scryfall_images(scryfall, live_bps)
 
     items = {}
     skipped = 0
@@ -587,7 +698,8 @@ def build_items(ct, cache, markup, min_price, only_singles):
             "tags": tags,
             "game_name": game_name,
             "description": desc,
-            "image": bp.get("image"),
+            "images": hd.get(bp.get("scryfall_id") or "") or ([bp["image"]] if bp.get("image") else []),
+            "hd": bool(hd.get(bp.get("scryfall_id") or "")),
         }
     if skipped:
         log(f"  (ignorati {skipped} articoli non singoli)")
@@ -609,6 +721,8 @@ def main():
     since = os.environ.get("ORDERS_SINCE", "").strip() or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cache_path = os.environ.get("CACHE_FILE", ".cache/blueprints.json")
     max_create = int(env_float("MAX_CREATE", 300))
+    hd_images = env_bool("HD_IMAGES", True)
+    max_img = int(env_float("MAX_IMAGE_UPDATES", 300))
 
     log(f"=== Sync CardTrader → Shopify {'(PROVA: nessuna modifica)' if DRY_RUN else '(MODIFICHE ATTIVE)'} ===")
     ct = CardTrader(ct_token)
@@ -655,12 +769,13 @@ def main():
     if not cache.data["expansions"]:
         log("CardTrader: scarico l'elenco delle espansioni…")
         cache.load_expansions()
-    items = build_items(ct, cache, markup, min_price, only_singles)
+    items = build_items(ct, cache, markup, min_price, only_singles, Scryfall() if hd_images else None)
     cache.save()
     existing = sh.synced_products(location_id)
     log(f"CardTrader: {len(items)} articoli · Shopify: {len(existing)} prodotti già sincronizzati")
 
     created = updated_qty = updated_price = zeroed = errors = pending_new = 0
+    img_done = img_pending = 0
     for ct_id, it in items.items():
         try:
             ex = existing.get(ct_id)
@@ -672,6 +787,8 @@ def main():
                     continue
                 log(f"+ Nuovo: {it['title']} — {it['qty']} pz a € {it['price']:.2f}")
                 if not DRY_RUN:
+                    if it["hd"]:
+                        it = dict(it, tags=it["tags"] + [HD_TAG])
                     sh.create_product(it, location_id, publication_id)
                 created += 1
                 continue
@@ -685,6 +802,14 @@ def main():
                 if not DRY_RUN:
                     sh.set_quantity(ex["inventory_item_id"], location_id, it["qty"], ex["qty"])
                 updated_qty += 1
+            if it["hd"] and HD_TAG not in ex["tags"]:
+                if img_done >= max_img:
+                    img_pending += 1
+                else:
+                    log(f"🖼 Immagine HD: {it['title']}")
+                    if not DRY_RUN:
+                        sh.replace_images(ex["product_id"], ex["media_ids"], it["images"], it["title"])
+                    img_done += 1
         except Exception as e:
             errors += 1
             log(f"! Errore su articolo {ct_id}: {e}")
@@ -703,10 +828,12 @@ def main():
 
     log(
         f"=== Fatto: {done_orders} ordini Shopify riportati su CardTrader · {created} nuovi · "
-        f"{updated_qty} quantità · {updated_price} prezzi · {zeroed} esauriti · {errors} errori ==="
+        f"{updated_qty} quantità · {updated_price} prezzi · {img_done} immagini HD · {zeroed} esauriti · {errors} errori ==="
     )
     if pending_new:
         log(f"(altre {pending_new} carte nuove verranno create nei prossimi giri, {max_create} alla volta)")
+    if img_pending:
+        log(f"(altre {img_pending} immagini HD verranno sostituite nei prossimi giri, {max_img} alla volta)")
     if errors:
         sys.exit(1)
 
