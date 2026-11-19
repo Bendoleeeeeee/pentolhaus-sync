@@ -1,0 +1,74 @@
+name: Sync CardTrader → Shopify
+
+on:
+  schedule:
+    - cron: "2-59/5 * * * *"   # ogni 5 minuti (sfalsato per evitare i picchi di GitHub)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Modalità prova (non modifica nulla)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # serve solo al passaggio "tieni vivo il repository"
+
+concurrency:
+  group: ct-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ripristina cache blueprint
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache
+          key: ct-blueprints-${{ github.run_id }}
+          restore-keys: ct-blueprints-
+
+      - name: Sincronizza
+        env:
+          CARDTRADER_TOKEN: ${{ secrets.CARDTRADER_TOKEN }}
+          SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+          SHOPIFY_SHOP: ${{ vars.SHOPIFY_SHOP }}
+          # Avvio manuale: decide la casella "Modalità prova". Avvio automatico: la variabile DRY_RUN (default: prova).
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry_run) || vars.DRY_RUN || 'true' }}
+          PRICE_MARKUP_PERCENT: ${{ vars.PRICE_MARKUP_PERCENT }}
+          MIN_PRICE: ${{ vars.MIN_PRICE }}
+          ORDERS_SINCE: ${{ vars.ORDERS_SINCE }}
+          ONLY_SINGLES: ${{ vars.ONLY_SINGLES }}
+        run: python sync.py
+
+      - name: Salva cache blueprint
+        if: always() && hashFiles('.cache/blueprints.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .cache
+          key: ct-blueprints-${{ github.run_id }}
+
+      # GitHub sospende le esecuzioni programmate dei repository pubblici dopo 60 giorni senza attività:
+      # se l'ultimo commit ha più di 45 giorni, ne crea uno vuoto per tenerlo attivo.
+      - name: Tieni vivo il repository
+        if: github.event_name == 'schedule'
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $(( (now - last) / 86400 )) -ge 45 ]; then
+            git config user.name "ct-sync-bot"
+            git config user.email "ct-sync-bot@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git push
+          fi
