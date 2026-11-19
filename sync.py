@@ -25,6 +25,8 @@ Variabili d'ambiente
 
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import time
 import urllib.error
@@ -116,14 +118,19 @@ class CardTrader:
     def __init__(self, token):
         self.h = {"Authorization": f"Bearer {token}"}
         self._calls = []
+        self._lock = threading.Lock()
 
     def _throttle(self):
         # limite: 200 richieste ogni 10 secondi
-        now = time.time()
-        self._calls = [t for t in self._calls if now - t < 10]
-        if len(self._calls) >= 180:
-            time.sleep(10 - (now - self._calls[0]) + 0.1)
-        self._calls.append(time.time())
+        while True:
+            with self._lock:
+                now = time.time()
+                self._calls = [t for t in self._calls if now - t < 10]
+                if len(self._calls) < 170:
+                    self._calls.append(now)
+                    return
+                wait = 10 - (now - self._calls[0]) + 0.05
+            time.sleep(max(wait, 0.05))
 
     def get(self, path, params=None):
         self._throttle()
@@ -426,22 +433,25 @@ class BlueprintCache:
         self.data.setdefault("blueprints", {})
         self.data.setdefault("expansions", {})
         self._loaded_exp = set()
+        self._lock = threading.Lock()
 
     def save(self):
         if not self.path:
             return
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        snapshot = {"blueprints": self.data["blueprints"].copy(), "expansions": self.data["expansions"].copy()}
         with open(self.path, "w", encoding="utf-8") as f:
-            json.dump(self.data, f)
+            json.dump(snapshot, f)
 
     def load_expansions(self):
         for e in as_list(self.ct.expansions()):
             self.data["expansions"][str(e["id"])] = {"name": e.get("name"), "code": e.get("code"), "game_id": e.get("game_id")}
 
     def _load_expansion_blueprints(self, exp_id):
-        if exp_id in self._loaded_exp:
-            return
-        self._loaded_exp.add(exp_id)
+        with self._lock:
+            if exp_id in self._loaded_exp:
+                return
+            self._loaded_exp.add(exp_id)
         for b in as_list(self.ct.blueprints_of_expansion(exp_id)):
             img = b.get("image_url") or ""
             if img.startswith("/"):
@@ -453,6 +463,24 @@ class BlueprintCache:
                 "game_id": b.get("game_id"),
                 "image": img or None,
             }
+
+    def prefetch(self, blueprint_ids):
+        """Recupera in parallelo i blueprint non ancora in cache."""
+        missing = sorted({str(b) for b in blueprint_ids if b is not None and str(b) not in self.data["blueprints"]})
+        if not missing:
+            return
+        log(f"  Recupero le schede di {len(missing)} carte nuove (solo la prima volta)…")
+        done = [0]
+        def work(bid):
+            self.get(bid)
+            with self._lock:
+                done[0] += 1
+                if done[0] % 50 == 0:
+                    log(f"    … {done[0]}/{len(missing)}")
+                    self.save()
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(work, missing))
+        log(f"  Schede recuperate: {len(missing)}")
 
     def get(self, blueprint_id):
         key = str(blueprint_id)
@@ -490,15 +518,21 @@ def build_items(ct, cache, markup, min_price, only_singles):
         log(f"  ! categorie non lette ({e}): sincronizzo tutto")
         only_singles = False
 
+    log("CardTrader: scarico l'inventario…")
+    products = as_list(ct.products())
+    log(f"CardTrader: {len(products)} articoli in totale")
+    wanted = [p for p in products if not only_singles or p.get("category_id") in single_cats]
+    cache.prefetch(p.get("blueprint_id") for p in wanted if int(p.get("quantity") or 0) > 0)
+
     items = {}
     skipped = 0
-    for p in as_list(ct.products()):
+    for p in products:
         if only_singles and p.get("category_id") not in single_cats:
             skipped += 1
             continue
         qty = int(p.get("quantity") or 0)
         ct_id = str(p["id"])
-        bp = cache.get(p.get("blueprint_id")) or {}
+        bp = cache.data["blueprints"].get(str(p.get("blueprint_id"))) or (cache.get(p.get("blueprint_id")) if qty > 0 else None) or {}
         exp = cache.data["expansions"].get(str(bp.get("expansion_id"))) or {}
         name = p.get("name_en") or bp.get("name") or f"Carta {p.get('blueprint_id')}"
         game_name = games.get(p.get("game_id")) or games.get(bp.get("game_id"))
@@ -586,6 +620,7 @@ def main():
 
     # 1) Ordini Shopify → scala CardTrader
     orders = sh.pending_orders(since)
+    log(f"Shopify: {len(orders)} ordini da controllare")
     done_orders = 0
     for o in orders:
         if o.get("cancelledAt"):
@@ -617,6 +652,7 @@ def main():
     # 2) Inventario CardTrader → Shopify
     cache = BlueprintCache(cache_path, ct)
     if not cache.data["expansions"]:
+        log("CardTrader: scarico l'elenco delle espansioni…")
         cache.load_expansions()
     items = build_items(ct, cache, markup, min_price, only_singles)
     cache.save()
