@@ -608,6 +608,7 @@ def main():
     only_singles = env_bool("ONLY_SINGLES", True)
     since = os.environ.get("ORDERS_SINCE", "").strip() or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cache_path = os.environ.get("CACHE_FILE", ".cache/blueprints.json")
+    max_create = int(env_float("MAX_CREATE", 300))
 
     log(f"=== Sync CardTrader → Shopify {'(PROVA: nessuna modifica)' if DRY_RUN else '(MODIFICHE ATTIVE)'} ===")
     ct = CardTrader(ct_token)
@@ -659,12 +660,15 @@ def main():
     existing = sh.synced_products(location_id)
     log(f"CardTrader: {len(items)} articoli · Shopify: {len(existing)} prodotti già sincronizzati")
 
-    created = updated_qty = updated_price = zeroed = errors = 0
+    created = updated_qty = updated_price = zeroed = errors = pending_new = 0
     for ct_id, it in items.items():
         try:
             ex = existing.get(ct_id)
             if not ex:
                 if it["qty"] <= 0:
+                    continue
+                if created >= max_create:
+                    pending_new += 1
                     continue
                 log(f"+ Nuovo: {it['title']} — {it['qty']} pz a € {it['price']:.2f}")
                 if not DRY_RUN:
@@ -701,6 +705,8 @@ def main():
         f"=== Fatto: {done_orders} ordini Shopify riportati su CardTrader · {created} nuovi · "
         f"{updated_qty} quantità · {updated_price} prezzi · {zeroed} esauriti · {errors} errori ==="
     )
+    if pending_new:
+        log(f"(altre {pending_new} carte nuove verranno create nei prossimi giri, {max_create} alla volta)")
     if errors:
         sys.exit(1)
 
