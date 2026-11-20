@@ -1207,7 +1207,11 @@ def main():
                     if key not in real_keys and (CATALOG_SKU + key) not in placeholders]
             log(f"Catalogo {g}: {len(catalog)} versioni · {len(set(catalog) & real_keys)} già in vetrina · {len(todo)} da aggiungere")
             if not set(catalog) & real_keys:
-                log(f"  (esempi di carte vere: {sorted(k for k in real_keys if k)[:8]} · esempi di catalogo: {sorted(catalog)[:8]})")
+                for it in items.values():
+                    if g in it["tags"] and it.get("bp_key"):
+                        b = cache.data["blueprints"].get(it["bp_key"].split("-")[0]) or {}
+                        log(f"  (vera {it['bp_key']}: in catalogo={it['bp_key'] in catalog} · categoria={b.get('category_id')} · "
+                            f"foil={b.get('foil')} · espansione={b.get('expansion_id')} · gioco={b.get('game_id')})")
             for it in todo:
                 if cat_created >= max_catalog:
                     cat_pending += 1
