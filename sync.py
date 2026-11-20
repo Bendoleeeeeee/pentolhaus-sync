@@ -47,6 +47,8 @@ SHOPIFY_API_VERSION = "2026-10"
 SYNC_TAG = "cardtrader"
 ORDER_DONE_TAG = "ct-synced"
 HD_TAG = "img-hd"
+CATALOG_TAG = "catalogo"  # carte del catalogo completo, mai avute in magazzino: esaurite e senza prezzo
+CATALOG_SKU = "BP-"  # SKU dei segnaposto: CT-BP-<blueprint>-<f|n>
 MF_NS = "carta"  # campi per i filtri del negozio: espansione, rarita, lingua, condizione, foil
 
 RARITY_IT = {
@@ -470,6 +472,33 @@ class Shopify:
                 log(f"  ! pubblicazione: {p['publishablePublish']['userErrors']}")
         return pid
 
+    def shop_counts(self):
+        """Il riepilogo dei pezzi disponibili salvato sul negozio (per le vetrine del tema)."""
+        d = self.gql('{ shop { id metafield(namespace: "pentolhaus", key: "disponibili") { value } } }')
+        mf = d["shop"].get("metafield") or {}
+        try:
+            cur = json.loads(mf.get("value") or "null")
+        except ValueError:
+            cur = None
+        return d["shop"]["id"], cur
+
+    def set_shop_counts(self, shop_id, value):
+        d = self.gql(
+            """mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { field message } } }""",
+            {"m": [{"ownerId": shop_id, "namespace": "pentolhaus", "key": "disponibili", "type": "json",
+                    "value": json.dumps(value, ensure_ascii=False, sort_keys=True)}]},
+        )
+        if d["metafieldsSet"]["userErrors"]:
+            raise RuntimeError(f"metafieldsSet negozio: {d['metafieldsSet']['userErrors']}")
+
+    def delete_product(self, product_id):
+        d = self.gql(
+            "mutation($id: ID!) { productDelete(input: {id: $id}) { deletedProductId userErrors { message } } }",
+            {"id": product_id},
+        )
+        if d["productDelete"]["userErrors"]:
+            raise RuntimeError(f"productDelete: {d['productDelete']['userErrors']}")
+
     def set_metafields(self, entries):
         """entries: lista di (product_id, chiave, valore). Max 25 per chiamata."""
         for i in range(0, len(entries), 25):
@@ -591,6 +620,24 @@ def pick_props(props):
     return condition, lang, foil, number
 
 
+def foil_options(editable):
+    """Versioni vendibili di un blueprint: 'both', 'foil' o 'nonfoil' (dalle proprietà modificabili CardTrader)."""
+    for prop in editable or []:
+        if "foil" in (prop.get("name") or "").lower():
+            vals = {str(v).lower() for v in (prop.get("possible_values") or [])}
+            has_t, has_f = "true" in vals, "false" in vals
+            if has_t and not has_f:
+                return "foil"
+            if has_f and not has_t:
+                return "nonfoil"
+            return "both" if has_t else "nonfoil"
+    return "nonfoil"
+
+
+def catalog_key(blueprint_id, foil):
+    return f"{blueprint_id}-{'f' if foil else 'n'}"
+
+
 class BlueprintCache:
     def __init__(self, path, ct):
         self.path = path
@@ -608,6 +655,7 @@ class BlueprintCache:
         self.data.setdefault("piltover", {})
         self.data.setdefault("piltover_at", 0)
         self.data.setdefault("bad_urls", {})
+        self.data.setdefault("catalog_at", {})
         self._loaded_exp = set()
         self._lock = threading.Lock()
 
@@ -617,7 +665,8 @@ class BlueprintCache:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         snapshot = {"blueprints": self.data["blueprints"].copy(), "expansions": self.data["expansions"].copy(),
                     "scryfall": self.data["scryfall"].copy(), "piltover": self.data["piltover"].copy(),
-                    "piltover_at": self.data["piltover_at"], "bad_urls": self.data["bad_urls"].copy()}
+                    "piltover_at": self.data["piltover_at"], "bad_urls": self.data["bad_urls"].copy(),
+                    "catalog_at": self.data["catalog_at"].copy()}
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(snapshot, f)
 
@@ -643,6 +692,8 @@ class BlueprintCache:
                 "scryfall_id": b.get("scryfall_id") or "",
                 "cm_ids": [str(x) for x in (b.get("card_market_ids") or []) if x],
                 "rarity": find_rarity(b.get("fixed_properties")) or "",
+                "category_id": b.get("category_id"),
+                "foil": foil_options(b.get("editable_properties")),
             }
 
     def prefetch(self, blueprint_ids):
@@ -846,8 +897,10 @@ def build_items(ct, cache, markup, min_price, only_singles, scryfall=None, pilto
             desc += f"<p>{p['description']}</p>"
         desc += "<p>Controllata da me, spedita in bustina + toploader.</p>"
 
+        bp_key = catalog_key(p.get("blueprint_id"), foil) if p.get("blueprint_id") else ""
         items[ct_id] = {
             "ct_id": ct_id,
+            "bp_key": bp_key,
             "title": title[:255],
             "qty": max(qty, 0),
             "price": price,
@@ -860,12 +913,87 @@ def build_items(ct, cache, markup, min_price, only_singles, scryfall=None, pilto
                 "lingua": LANG_IT.get((lang or "").lower(), (lang or "").upper()),
                 "condizione": condition or "",
                 "foil": "Sì" if foil else "No",
+                "bp": bp_key,
             }.items() if v},
             **pick_images(bp, gt, hd, pa, scryfall is not None),
         }
     if skipped:
         log(f"  (ignorati {skipped} articoli non singoli)")
     return items
+
+
+def build_catalog(ct, cache, game_keyword, piltover=None, refresh_hours=24):
+    """Tutte le carte singole di un gioco (es. 'riftbound'), una voce per versione foil/non foil.
+    Restituisce {chiave "blueprint-f|n": item}: segnaposto esauriti e senza prezzo."""
+    games = {g["id"]: (g.get("display_name") or g.get("name")) for g in as_list(ct.games())}
+    game_ids = {gid for gid, gname in games.items() if game_tag(gname) == game_keyword}
+    if not game_ids:
+        log(f"  ! catalogo: gioco '{game_keyword}' non trovato su CardTrader")
+        return {}
+    single_cats = {c["id"] for c in as_list(ct.categories())
+                   if c.get("game_id") in game_ids and "single" in (c.get("name") or "").lower()}
+    if not any(int(e.get("game_id") or 0) in game_ids for e in cache.data["expansions"].values()):
+        cache.load_expansions()
+    exp_ids = sorted(eid for eid, e in cache.data["expansions"].items() if int(e.get("game_id") or 0) in game_ids)
+    last = float(cache.data["catalog_at"].get(game_keyword) or 0)
+    if time.time() - last > refresh_hours * 3600:
+        log(f"Catalogo {game_keyword}: aggiorno le schede di {len(exp_ids)} espansioni…")
+        cache.load_expansions()
+        exp_ids = sorted(eid for eid, e in cache.data["expansions"].items() if int(e.get("game_id") or 0) in game_ids)
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(cache._load_expansion_blueprints, [int(x) for x in exp_ids]))
+        cache.data["catalog_at"][game_keyword] = time.time()
+    exp_set = {int(x) for x in exp_ids}
+    bps = {bid: bp for bid, bp in cache.data["blueprints"].items()
+           if int(bp.get("expansion_id") or 0) in exp_set and int(bp.get("game_id") or 0) in game_ids
+           and (not single_cats or bp.get("category_id") in single_cats)}
+    pa = {}
+    if piltover is not None and game_keyword == "riftbound":
+        need = {cm for bp in bps.values() for cm in (bp.get("cm_ids") or [])}
+        pa = cache.piltover_images(piltover, need) if need else {}
+    game_name = next(iter(games[g] for g in game_ids))
+    out = {}
+    for bid, bp in bps.items():
+        exp = cache.data["expansions"].get(str(bp.get("expansion_id"))) or {}
+        name = bp.get("name") or f"Carta {bid}"
+        if bp.get("version"):
+            name += f" ({bp['version']})"
+        opts = bp.get("foil") or "nonfoil"
+        rarity = bp.get("rarity") or ""
+        for foil in ([False] if opts == "nonfoil" else [True] if opts == "foil" else [False, True]):
+            key = catalog_key(bid, foil)
+            title = name + (" · " + exp["name"] if exp.get("name") else "") + (" (Foil)" if foil else "")
+            tags = [SYNC_TAG, CATALOG_TAG, "singola", game_keyword]
+            if exp.get("code"):
+                tags.append("espansione-" + slug(exp["code"]))
+            if foil:
+                tags.append("foil")
+            rows = [("Gioco", game_name),
+                    ("Espansione", f"{exp.get('name')} ({(exp.get('code') or '').upper()})" if exp.get("name") else None),
+                    ("Foil", "Sì" if foil else "No")]
+            desc = ("<ul>" + "".join(f"<li><strong>{k}:</strong> {v}</li>" for k, v in rows if v) + "</ul>"
+                    "<p>Al momento non ce l'ho in vetrina. Scrivimi se la cerchi: te la trovo io.</p>")
+            imgs = pick_images(bp, game_keyword, {}, pa, True)
+            if imgs["hd"] and pa and imgs["images"][0] in pa.values():
+                imgs["trusted"] = True
+            out[key] = {
+                "ct_id": CATALOG_SKU + key,
+                "bp_key": key,
+                "title": title[:255],
+                "qty": 0,
+                "price": 0.0,
+                "tags": tags,
+                "game_name": game_name,
+                "description": desc,
+                "mf": {k: v for k, v in {
+                    "espansione": exp.get("name") or "",
+                    "rarita": RARITY_IT.get(rarity.lower(), rarity),
+                    "foil": "Sì" if foil else "No",
+                    "bp": key,
+                }.items() if v},
+                **imgs,
+            }
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +1015,8 @@ def main():
     max_create = int(env_float("MAX_CREATE", 300))
     hd_images = env_bool("HD_IMAGES", True)
     max_img = int(env_float("MAX_IMAGE_UPDATES", 300))
+    catalog_games = [g.strip().lower() for g in os.environ.get("CATALOG_GAMES", "riftbound").split(",") if g.strip()]
+    max_catalog = int(env_float("MAX_CATALOG_CREATE", 300))
 
     log(f"=== Sync CardTrader → Shopify {'(PROVA: nessuna modifica)' if DRY_RUN else '(MODIFICHE ATTIVE)'} ===")
     ct = CardTrader(ct_token)
@@ -909,7 +1039,8 @@ def main():
         if (o.get("displayFinancialStatus") or "").upper() not in ("PAID", "PARTIALLY_REFUNDED", "PARTIALLY_PAID", "AUTHORIZED"):
             continue
         lines = [(li["sku"][len(SKU_PREFIX):], li["quantity"]) for li in o["lineItems"]["nodes"]
-                 if (li.get("sku") or "").startswith(SKU_PREFIX)]
+                 if (li.get("sku") or "").startswith(SKU_PREFIX)
+                 and not li["sku"][len(SKU_PREFIX):].startswith(CATALOG_SKU)]
         if not lines:
             if not DRY_RUN:
                 sh.tag_order(o["id"])
@@ -952,7 +1083,10 @@ def main():
         return False
     cache.save()
     existing = sh.synced_products(location_id)
-    log(f"CardTrader: {len(items)} articoli · Shopify: {len(existing)} prodotti già sincronizzati")
+    placeholders = {k: v for k, v in existing.items() if k.startswith(CATALOG_SKU)}
+    existing = {k: v for k, v in existing.items() if not k.startswith(CATALOG_SKU)}
+    log(f"CardTrader: {len(items)} articoli · Shopify: {len(existing)} prodotti già sincronizzati"
+        + (f" · {len(placeholders)} carte di catalogo" if placeholders else ""))
 
     created = updated_qty = updated_price = zeroed = errors = pending_new = 0
     img_done = img_pending = 0
@@ -1022,11 +1156,77 @@ def main():
             errors += 1
             log(f"! Errore azzerando {ct_id}: {e}")
 
+    # Riepilogo dei pezzi disponibili per gioco ed espansione (il tema lo usa nelle vetrine)
+    counts = {"giochi": {}, "espansioni": {}}
+    for it in items.values():
+        if it["qty"] <= 0:
+            continue
+        g = next((t for t in it["tags"] if t in ("magic", "pokemon", "riftbound")), None) or game_tag(it["game_name"]) or "altro"
+        counts["giochi"][g] = counts["giochi"].get(g, 0) + 1
+        e = it["mf"].get("espansione")
+        if e:
+            counts["espansioni"].setdefault(g, {})
+            counts["espansioni"][g][e] = counts["espansioni"][g].get(e, 0) + 1
+    try:
+        shop_id, cur_counts = sh.shop_counts()
+        if cur_counts != counts:
+            log(f"Vetrine: pezzi disponibili {counts['giochi']}")
+            if not DRY_RUN:
+                sh.set_shop_counts(shop_id, counts)
+    except Exception as e:
+        errors += 1
+        log(f"! Errore sul riepilogo dei pezzi: {e}")
+
+    # 3) Catalogo completo: le carte che non ho mai avuto, esaurite e senza prezzo
+    cat_created = cat_removed = cat_pending = 0
+    if catalog_games:
+        real_keys = {it["bp_key"] for it in items.values() if it.get("bp_key")}
+        real_keys |= {ex["mf"].get("bp") for ex in existing.values() if ex["mf"].get("bp")}
+        for ph_sku, ph in placeholders.items():
+            if ph_sku[len(CATALOG_SKU):] in real_keys:
+                try:
+                    log(f"- Catalogo → vera: tolgo il segnaposto di {ph['title']}")
+                    if not DRY_RUN:
+                        sh.delete_product(ph["product_id"])
+                    cat_removed += 1
+                except Exception as e:
+                    errors += 1
+                    log(f"! Errore togliendo il segnaposto {ph_sku}: {e}")
+        for g in catalog_games:
+            try:
+                catalog = build_catalog(ct, cache, g, PiltoverArchive() if hd_images else None)
+            except Exception as e:
+                errors += 1
+                log(f"! Catalogo {g}: {e}")
+                continue
+            todo = [it for key, it in sorted(catalog.items())
+                    if key not in real_keys and (CATALOG_SKU + key) not in placeholders]
+            log(f"Catalogo {g}: {len(catalog)} versioni · {len(todo)} da aggiungere")
+            for it in todo:
+                if cat_created >= max_catalog:
+                    cat_pending += 1
+                    continue
+                try:
+                    if not DRY_RUN:
+                        if hd_available(it):
+                            it = dict(it, tags=it["tags"] + [HD_TAG])
+                        else:
+                            it = dict(it, images=it["fallback"])
+                        sh.create_product(it, location_id, publication_id)
+                    cat_created += 1
+                except Exception as e:
+                    errors += 1
+                    log(f"! Errore sul catalogo {it['title']}: {e}")
+        if cat_created:
+            log(f"📚 Catalogo: aggiunte {cat_created} carte esaurite")
+
     log(
         f"=== Fatto: {done_orders} ordini Shopify riportati su CardTrader · {created} nuovi · "
         f"{updated_qty} quantità · {updated_price} prezzi · {img_done} immagini HD · "
-        f"{len({x[0] for x in mf_todo})} filtri · {zeroed} esauriti · {errors} errori ==="
+        f"{len({x[0] for x in mf_todo})} filtri · {zeroed} esauriti · {cat_created} catalogo · {errors} errori ==="
     )
+    if cat_pending:
+        log(f"(altre {cat_pending} carte di catalogo verranno aggiunte nei prossimi giri, {max_catalog} alla volta)")
     if pending_new:
         log(f"(altre {pending_new} carte nuove verranno create nei prossimi giri, {max_create} alla volta)")
     cache.save()
