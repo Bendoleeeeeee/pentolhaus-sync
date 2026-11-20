@@ -694,6 +694,7 @@ class BlueprintCache:
                 "rarity": find_rarity(b.get("fixed_properties")) or "",
                 "category_id": b.get("category_id"),
                 "foil": foil_options(b.get("editable_properties")),
+                "props": sorted({(x.get("name") or "") for x in (b.get("editable_properties") or [])}),
             }
 
     def prefetch(self, blueprint_ids):
@@ -952,6 +953,9 @@ def build_catalog(ct, cache, game_keyword, piltover=None, refresh_hours=24):
         need = {cm for bp in bps.values() for cm in (bp.get("cm_ids") or [])}
         pa = cache.piltover_images(piltover, need) if need else {}
     game_name = next(iter(games[g] for g in game_ids))
+    from collections import Counter
+    log(f"  versioni foil: {dict(Counter(bp.get('foil') or 'nonfoil' for bp in bps.values()))} · "
+        f"proprietà: {sorted({n for bp in bps.values() for n in (bp.get('props') or [])})}")
     out = {}
     for bid, bp in bps.items():
         exp = cache.data["expansions"].get(str(bp.get("expansion_id"))) or {}
@@ -1201,7 +1205,9 @@ def main():
                 continue
             todo = [it for key, it in sorted(catalog.items())
                     if key not in real_keys and (CATALOG_SKU + key) not in placeholders]
-            log(f"Catalogo {g}: {len(catalog)} versioni · {len(todo)} da aggiungere")
+            log(f"Catalogo {g}: {len(catalog)} versioni · {len(set(catalog) & real_keys)} già in vetrina · {len(todo)} da aggiungere")
+            if not set(catalog) & real_keys:
+                log(f"  (esempi di carte vere: {sorted(k for k in real_keys if k)[:8]} · esempi di catalogo: {sorted(catalog)[:8]})")
             for it in todo:
                 if cat_created >= max_catalog:
                     cat_pending += 1
