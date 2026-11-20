@@ -18,6 +18,9 @@ Variabili d'ambiente
   DRY_RUN                 "true" = non modifica nulla, scrive solo cosa farebbe (default true)
   PRICE_MARKUP_PERCENT    ricarico % sul prezzo CardTrader, es. 10 o -5 (default 0)
   MIN_PRICE               prezzo minimo su Shopify in euro (default 0.10)
+  MIN_PRICE_UNCOMMON      prezzo minimo delle non comuni (default 0.50)
+  MIN_PRICE_RARE          prezzo minimo di rare, rare mitiche e superiori (default 1.00)
+  ROUND_PRICES            "true" = prezzi tondi: sotto 10 € ai 10 cent, fino a 100 € ai 50 cent, sopra all'euro (default true)
   ORDERS_SINCE            data ISO: considera solo gli ordini Shopify da questa data (default: oggi)
   ONLY_SINGLES            "true" = sincronizza solo le carte singole (default true)
   CACHE_FILE              file cache dei blueprint (default .cache/blueprints.json)
@@ -519,6 +522,27 @@ def game_tag(game_name):
     return slug(game_name) or None
 
 
+def find_rarity(*dicts):
+    """La rarità dalle proprietà CardTrader (mtg_rarity, pokemon_rarity, riftbound_rarity…)."""
+    for d in dicts:
+        for k, v in (d or {}).items():
+            if "rarity" in k.lower() and v:
+                return str(v)
+    return None
+
+
+def rarity_tier(rarity):
+    """'rare' per rare/mitiche/epiche/showcase/secret…, 'uncommon' per le non comuni, altrimenti None."""
+    r = (rarity or "").lower()
+    if not r:
+        return None
+    if "uncommon" in r:
+        return "uncommon"
+    if any(w in r for w in ("rare", "mythic", "epic", "showcase", "legend", "secret")):
+        return "rare"
+    return None
+
+
 def pick_props(props):
     props = props or {}
     lang, foil, condition, number = None, False, None, None
@@ -588,6 +612,7 @@ class BlueprintCache:
                 "image": img or None,
                 "scryfall_id": b.get("scryfall_id") or "",
                 "cm_ids": [str(x) for x in (b.get("card_market_ids") or []) if x],
+                "rarity": find_rarity(b.get("fixed_properties")) or "",
             }
 
     def prefetch(self, blueprint_ids):
@@ -613,11 +638,11 @@ class BlueprintCache:
         exps = set()
         for b in blueprint_ids:
             bp = self.data["blueprints"].get(str(b))
-            if bp and ("scryfall_id" not in bp or "cm_ids" not in bp) and bp.get("expansion_id"):
+            if bp and ("scryfall_id" not in bp or "cm_ids" not in bp or "rarity" not in bp) and bp.get("expansion_id"):
                 exps.add(bp["expansion_id"])
         if not exps:
             return
-        log(f"  Recupero gli ID Scryfall/Cardmarket da {len(exps)} espansioni (solo la prima volta)…")
+        log(f"  Aggiorno le schede (ID Scryfall/Cardmarket, rarità) di {len(exps)} espansioni (solo la prima volta)…")
         with ThreadPoolExecutor(max_workers=8) as ex:
             list(ex.map(self._load_expansion_blueprints, sorted(exps)))
 
@@ -695,7 +720,15 @@ def pick_images(bp, gt, scry, pa, hd_on):
     return out
 
 
-def build_items(ct, cache, markup, min_price, only_singles, scryfall=None, piltover=None):
+def round_price(price):
+    """Prezzo "tondo", al valore più vicino: 3,86→3,90 · 33,25→33,50 · 599,11→599,00."""
+    from decimal import Decimal, ROUND_HALF_UP
+    step = Decimal("0.10") if price < 10 else (Decimal("0.50") if price < 100 else Decimal("1"))
+    units = (Decimal(str(round(price, 4))) / step).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return float(units * step)
+
+
+def build_items(ct, cache, markup, min_price, only_singles, scryfall=None, piltover=None, rounding=True, min_by_tier=None):
     games = {g["id"]: (g.get("display_name") or g.get("name")) for g in as_list(ct.games())}
     single_cats = set()
     try:
@@ -713,8 +746,8 @@ def build_items(ct, cache, markup, min_price, only_singles, scryfall=None, pilto
     live_bps = [p.get("blueprint_id") for p in wanted if int(p.get("quantity") or 0) > 0]
     cache.prefetch(live_bps)
     hd, pa = {}, {}
+    cache.refresh_scryfall_ids(live_bps)
     if scryfall is not None:
-        cache.refresh_scryfall_ids(live_bps)
         hd = cache.scryfall_images(scryfall, live_bps)
     if piltover is not None:
         need = set()
@@ -752,7 +785,9 @@ def build_items(ct, cache, markup, min_price, only_singles, scryfall=None, pilto
         if isinstance(cents, dict):
             cents = cents.get("cents")
         price = (float(cents or 0) / 100.0) * (1 + markup / 100.0)
-        price = max(round(price, 2), min_price)
+        price = round_price(price) if rounding else round(price, 2)
+        tier = rarity_tier(find_rarity(p.get("properties_hash"), {"rarity": bp.get("rarity")}))
+        price = max(price, min_price, (min_by_tier or {}).get(tier, 0))
 
         tags = [SYNC_TAG, "singola" if p.get("category_id") in single_cats else "cardtrader-altro"]
         gt = game_tag(game_name)
@@ -806,6 +841,8 @@ def main():
         raise SystemExit("Mancano CARDTRADER_TOKEN o SHOPIFY_SHOP")
     markup = env_float("PRICE_MARKUP_PERCENT", 0.0)
     min_price = env_float("MIN_PRICE", 0.10)
+    rounding = env_bool("ROUND_PRICES", True)
+    min_by_tier = {"uncommon": env_float("MIN_PRICE_UNCOMMON", 0.50), "rare": env_float("MIN_PRICE_RARE", 1.00)}
     only_singles = env_bool("ONLY_SINGLES", True)
     since = os.environ.get("ORDERS_SINCE", "").strip() or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cache_path = os.environ.get("CACHE_FILE", ".cache/blueprints.json")
@@ -859,7 +896,7 @@ def main():
         log("CardTrader: scarico l'elenco delle espansioni…")
         cache.load_expansions()
     items = build_items(ct, cache, markup, min_price, only_singles,
-                        Scryfall() if hd_images else None, PiltoverArchive() if hd_images else None)
+                        Scryfall() if hd_images else None, PiltoverArchive() if hd_images else None, rounding, min_by_tier)
 
     def hd_available(it):
         """Controlla (una volta sola) che l'immagine HD esista davvero."""
