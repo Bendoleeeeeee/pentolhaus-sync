@@ -46,6 +46,18 @@ SHOPIFY_API_VERSION = "2026-10"
 SYNC_TAG = "cardtrader"
 ORDER_DONE_TAG = "ct-synced"
 HD_TAG = "img-hd"
+MF_NS = "carta"  # campi per i filtri del negozio: espansione, rarita, lingua, condizione, foil
+
+RARITY_IT = {
+    "common": "Comune", "uncommon": "Non comune", "rare": "Rara", "mythic": "Rara mitica",
+    "mythic rare": "Rara mitica", "special": "Speciale", "epic": "Epica", "showcase": "Showcase",
+    "promo": "Promo", "land": "Terra", "basic land": "Terra base", "token": "Pedina",
+}
+LANG_IT = {
+    "en": "Inglese", "it": "Italiano", "jp": "Giapponese", "ja": "Giapponese", "de": "Tedesco",
+    "fr": "Francese", "es": "Spagnolo", "pt": "Portoghese", "ru": "Russo", "kr": "Coreano", "ko": "Coreano",
+    "zh-cn": "Cinese semplificato", "zhs": "Cinese semplificato", "zh-tw": "Cinese tradizionale", "zht": "Cinese tradizionale",
+}
 SCRYFALL_API = "https://api.scryfall.com"
 PILTOVER_API = "https://piltoverarchive.com/api/external/v1"
 BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -341,13 +353,14 @@ class Shopify:
             nodes {
               id title status tags
               media(first: 10) { nodes { id } }
+              metafields(first: 10, namespace: "%s") { nodes { key value } }
               variants(first: 1) { nodes {
                 id sku price
                 inventoryItem { id inventoryLevel(locationId: $loc) { quantities(names: ["available"]) { quantity } } }
               } }
             }
           }
-        }""" % SYNC_TAG
+        }""" % (SYNC_TAG, MF_NS)
         out, after = {}, None
         while True:
             d = self.gql(q, {"after": after, "loc": location_id})
@@ -370,6 +383,7 @@ class Shopify:
                     "title": p["title"],
                     "tags": p.get("tags") or [],
                     "media_ids": [m["id"] for m in (p.get("media") or {}).get("nodes") or []],
+                    "mf": {m["key"]: m["value"] for m in (p.get("metafields") or {}).get("nodes") or []},
                     "variant_id": v["id"],
                     "price": float(v["price"]),
                     "inventory_item_id": (v.get("inventoryItem") or {}).get("id"),
@@ -428,6 +442,9 @@ class Shopify:
             "productOptions": [{"name": "Title", "values": [{"name": "Default Title"}]}],
             "variants": [variant],
         }
+        if item.get("mf"):
+            inp["metafields"] = [{"namespace": MF_NS, "key": k, "type": "single_line_text_field", "value": v}
+                                 for k, v in item["mf"].items()]
         if item.get("images"):
             inp["files"] = [{"originalSource": u, "contentType": "IMAGE", "alt": item["title"]} for u in item["images"]]
         d = self.gql(
@@ -451,6 +468,18 @@ class Shopify:
             if p["publishablePublish"]["userErrors"]:
                 log(f"  ! pubblicazione: {p['publishablePublish']['userErrors']}")
         return pid
+
+    def set_metafields(self, entries):
+        """entries: lista di (product_id, chiave, valore). Max 25 per chiamata."""
+        for i in range(0, len(entries), 25):
+            chunk = entries[i:i + 25]
+            d = self.gql(
+                """mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { field message } } }""",
+                {"m": [{"ownerId": pid, "namespace": MF_NS, "key": k, "type": "single_line_text_field", "value": v}
+                       for pid, k, v in chunk]},
+            )
+            if d["metafieldsSet"]["userErrors"]:
+                raise RuntimeError(f"metafield: {d['metafieldsSet']['userErrors']}")
 
     def update_price(self, product_id, variant_id, price):
         d = self.gql(
@@ -786,7 +815,8 @@ def build_items(ct, cache, markup, min_price, only_singles, scryfall=None, pilto
             cents = cents.get("cents")
         price = (float(cents or 0) / 100.0) * (1 + markup / 100.0)
         price = round_price(price) if rounding else round(price, 2)
-        tier = rarity_tier(find_rarity(p.get("properties_hash"), {"rarity": bp.get("rarity")}))
+        rarity = find_rarity(p.get("properties_hash"), {"rarity": bp.get("rarity")})
+        tier = rarity_tier(rarity)
         price = max(price, min_price, (min_by_tier or {}).get(tier, 0))
 
         tags = [SYNC_TAG, "singola" if p.get("category_id") in single_cats else "cardtrader-altro"]
@@ -823,6 +853,13 @@ def build_items(ct, cache, markup, min_price, only_singles, scryfall=None, pilto
             "tags": tags,
             "game_name": game_name,
             "description": desc,
+            "mf": {k: v for k, v in {
+                "espansione": exp.get("name") or "",
+                "rarita": RARITY_IT.get((rarity or "").lower(), rarity or ""),
+                "lingua": LANG_IT.get((lang or "").lower(), (lang or "").upper()),
+                "condizione": condition or "",
+                "foil": "Sì" if foil else "No",
+            }.items() if v},
             **pick_images(bp, gt, hd, pa, scryfall is not None),
         }
     if skipped:
@@ -918,6 +955,7 @@ def main():
 
     created = updated_qty = updated_price = zeroed = errors = pending_new = 0
     img_done = img_pending = 0
+    mf_todo = []
     for ct_id, it in items.items():
         try:
             ex = existing.get(ct_id)
@@ -946,6 +984,9 @@ def main():
                 if not DRY_RUN:
                     sh.set_quantity(ex["inventory_item_id"], location_id, it["qty"], ex["qty"])
                 updated_qty += 1
+            for k, v in it["mf"].items():
+                if ex["mf"].get(k) != v:
+                    mf_todo.append((ex["product_id"], k, v))
             if it["hd"] and HD_TAG not in ex["tags"] and it["images"][0] not in cache.data["bad_urls"]:
                 if img_done >= max_img:
                     img_pending += 1
@@ -957,6 +998,16 @@ def main():
         except Exception as e:
             errors += 1
             log(f"! Errore su articolo {ct_id}: {e}")
+
+    if mf_todo:
+        n_prod = len({x[0] for x in mf_todo})
+        log(f"🏷 Filtri (espansione, rarità, lingua…): aggiorno {n_prod} prodotti")
+        if not DRY_RUN:
+            try:
+                sh.set_metafields(mf_todo)
+            except Exception as e:
+                errors += 1
+                log(f"! Errore sui filtri: {e}")
 
     for ct_id, ex in existing.items():
         if ct_id in items or not ex["qty"]:
@@ -972,7 +1023,8 @@ def main():
 
     log(
         f"=== Fatto: {done_orders} ordini Shopify riportati su CardTrader · {created} nuovi · "
-        f"{updated_qty} quantità · {updated_price} prezzi · {img_done} immagini HD · {zeroed} esauriti · {errors} errori ==="
+        f"{updated_qty} quantità · {updated_price} prezzi · {img_done} immagini HD · "
+        f"{len({x[0] for x in mf_todo})} filtri · {zeroed} esauriti · {errors} errori ==="
     )
     if pending_new:
         log(f"(altre {pending_new} carte nuove verranno create nei prossimi giri, {max_create} alla volta)")
