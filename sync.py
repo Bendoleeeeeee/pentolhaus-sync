@@ -22,7 +22,8 @@ Variabili d'ambiente
   ONLY_SINGLES            "true" = sincronizza solo le carte singole (default true)
   CACHE_FILE              file cache dei blueprint (default .cache/blueprints.json)
   MAX_CREATE              massimo di carte nuove create per giro (default 300)
-  HD_IMAGES               "true" = immagini HD da Scryfall per le carte Magic (default true)
+  HD_IMAGES               "true" = immagini HD: Magic da Scryfall, Riftbound da Piltover Archive,
+                          le altre (Pokémon…) nella versione originale di CardTrader (default true)
   MAX_IMAGE_UPDATES       massimo di prodotti esistenti a cui cambiare immagine per giro (default 300)
 """
 
@@ -43,6 +44,8 @@ SYNC_TAG = "cardtrader"
 ORDER_DONE_TAG = "ct-synced"
 HD_TAG = "img-hd"
 SCRYFALL_API = "https://api.scryfall.com"
+PILTOVER_API = "https://piltoverarchive.com/api/external/v1"
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 SKU_PREFIX = "CT-"
 
 CONDITION_SHORT = {
@@ -214,6 +217,47 @@ class Scryfall:
                 if nf.get("id"):
                     out[nf["id"]] = []
         return out
+
+
+class PiltoverArchive:
+    """Immagini HD delle carte Riftbound (piltoverarchive.com), abbinate con l'ID Cardmarket."""
+
+    def all_images(self):
+        """Mappa id Cardmarket -> url immagine, per tutte le stampe Riftbound."""
+        out, page = {}, 1
+        while True:
+            d = http_json("GET", f"{PILTOVER_API}/cards?page={page}&limit=100", {"User-Agent": BROWSER_UA})
+            for v in d.get("data") or []:
+                if v.get("cardmarketId") and v.get("imageUrl"):
+                    out[str(v["cardmarketId"])] = v["imageUrl"]
+            if not (d.get("pagination") or {}).get("hasNext"):
+                break
+            page += 1
+            time.sleep(0.5)
+        return out
+
+
+def ct_full_image(url):
+    """L'anteprima CardTrader (preview_xxx.jpg, 180 px) → l'immagine originale (xxx.jpg)."""
+    if url and "/preview_" in url:
+        return url.replace("/preview_", "/", 1)
+    return None
+
+
+def url_ok(url):
+    """True se l'immagine esiste davvero (prima di sostituire quella vecchia)."""
+    for method in ("HEAD", "GET"):
+        req = urllib.request.Request(url, method=method, headers={"User-Agent": BROWSER_UA, "Range": "bytes=0-0"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.status in (200, 206) and (r.headers.get("Content-Type") or "image").startswith("image")
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 405) and method == "HEAD":
+                continue
+            return False
+        except Exception:
+            return False
+    return False
 
 
 def as_list(x):
@@ -497,7 +541,7 @@ class BlueprintCache:
     def __init__(self, path, ct):
         self.path = path
         self.ct = ct
-        self.data = {"blueprints": {}, "expansions": {}, "scryfall": {}}
+        self.data = {"blueprints": {}, "expansions": {}, "scryfall": {}, "piltover": {}, "piltover_at": 0, "bad_urls": {}}
         if path and os.path.exists(path):
             try:
                 with open(path, encoding="utf-8") as f:
@@ -507,6 +551,9 @@ class BlueprintCache:
         self.data.setdefault("blueprints", {})
         self.data.setdefault("expansions", {})
         self.data.setdefault("scryfall", {})
+        self.data.setdefault("piltover", {})
+        self.data.setdefault("piltover_at", 0)
+        self.data.setdefault("bad_urls", {})
         self._loaded_exp = set()
         self._lock = threading.Lock()
 
@@ -515,7 +562,8 @@ class BlueprintCache:
             return
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         snapshot = {"blueprints": self.data["blueprints"].copy(), "expansions": self.data["expansions"].copy(),
-                    "scryfall": self.data["scryfall"].copy()}
+                    "scryfall": self.data["scryfall"].copy(), "piltover": self.data["piltover"].copy(),
+                    "piltover_at": self.data["piltover_at"], "bad_urls": self.data["bad_urls"].copy()}
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(snapshot, f)
 
@@ -539,6 +587,7 @@ class BlueprintCache:
                 "game_id": b.get("game_id"),
                 "image": img or None,
                 "scryfall_id": b.get("scryfall_id") or "",
+                "cm_ids": [str(x) for x in (b.get("card_market_ids") or []) if x],
             }
 
     def prefetch(self, blueprint_ids):
@@ -564,11 +613,11 @@ class BlueprintCache:
         exps = set()
         for b in blueprint_ids:
             bp = self.data["blueprints"].get(str(b))
-            if bp and "scryfall_id" not in bp and bp.get("expansion_id"):
+            if bp and ("scryfall_id" not in bp or "cm_ids" not in bp) and bp.get("expansion_id"):
                 exps.add(bp["expansion_id"])
         if not exps:
             return
-        log(f"  Recupero gli ID Scryfall da {len(exps)} espansioni (solo la prima volta)…")
+        log(f"  Recupero gli ID Scryfall/Cardmarket da {len(exps)} espansioni (solo la prima volta)…")
         with ThreadPoolExecutor(max_workers=8) as ex:
             list(ex.map(self._load_expansion_blueprints, sorted(exps)))
 
@@ -587,6 +636,20 @@ class BlueprintCache:
             except Exception as e:
                 log(f"  ! Scryfall non raggiungibile ({e}): per ora tengo le immagini CardTrader")
         return self.data["scryfall"]
+
+    def piltover_images(self, piltover, need_ids):
+        """Mappa id Cardmarket -> url Piltover Archive; riscarica se vecchia di 7 giorni o se mancano carte (max 1 volta ogni 6 ore)."""
+        age = time.time() - float(self.data.get("piltover_at") or 0)
+        missing = [i for i in need_ids if i not in self.data["piltover"]]
+        if age > 7 * 86400 or (missing and age > 6 * 3600):
+            log(f"Piltover Archive: scarico l'elenco delle carte Riftbound…")
+            try:
+                self.data["piltover"] = piltover.all_images()
+                self.data["piltover_at"] = time.time()
+                log(f"  {len(self.data['piltover'])} stampe trovate")
+            except Exception as e:
+                log(f"  ! Piltover Archive non raggiungibile ({e}): uso le immagini originali di CardTrader")
+        return self.data["piltover"]
 
     def get(self, blueprint_id):
         key = str(blueprint_id)
@@ -613,7 +676,26 @@ class BlueprintCache:
         return self.data["blueprints"].get(key)
 
 
-def build_items(ct, cache, markup, min_price, only_singles, scryfall=None):
+def pick_images(bp, gt, scry, pa, hd_on):
+    """Sceglie l'immagine migliore: Scryfall (Magic), Piltover Archive (Riftbound), originale CardTrader (resto)."""
+    preview = [bp["image"]] if bp.get("image") else []
+    out = {"images": preview, "fallback": preview, "hd": False, "trusted": False}
+    if not hd_on:
+        return out
+    sf = scry.get(bp.get("scryfall_id") or "")
+    if sf:
+        return dict(out, images=sf, hd=True, trusted=True)
+    if gt == "riftbound":
+        for cm in bp.get("cm_ids") or []:
+            if pa.get(cm):
+                return dict(out, images=[pa[cm]], hd=True)
+    full = ct_full_image(bp.get("image"))
+    if full:
+        return dict(out, images=[full], hd=True)
+    return out
+
+
+def build_items(ct, cache, markup, min_price, only_singles, scryfall=None, piltover=None):
     games = {g["id"]: (g.get("display_name") or g.get("name")) for g in as_list(ct.games())}
     single_cats = set()
     try:
@@ -630,10 +712,18 @@ def build_items(ct, cache, markup, min_price, only_singles, scryfall=None):
     wanted = [p for p in products if not only_singles or p.get("category_id") in single_cats]
     live_bps = [p.get("blueprint_id") for p in wanted if int(p.get("quantity") or 0) > 0]
     cache.prefetch(live_bps)
-    hd = {}
+    hd, pa = {}, {}
     if scryfall is not None:
         cache.refresh_scryfall_ids(live_bps)
         hd = cache.scryfall_images(scryfall, live_bps)
+    if piltover is not None:
+        need = set()
+        for p in wanted:
+            bp = cache.data["blueprints"].get(str(p.get("blueprint_id"))) or {}
+            if int(p.get("quantity") or 0) > 0 and game_tag(games.get(p.get("game_id")) or games.get(bp.get("game_id"))) == "riftbound":
+                need.update(bp.get("cm_ids") or [])
+        if need:
+            pa = cache.piltover_images(piltover, need)
 
     items = {}
     skipped = 0
@@ -698,8 +788,7 @@ def build_items(ct, cache, markup, min_price, only_singles, scryfall=None):
             "tags": tags,
             "game_name": game_name,
             "description": desc,
-            "images": hd.get(bp.get("scryfall_id") or "") or ([bp["image"]] if bp.get("image") else []),
-            "hd": bool(hd.get(bp.get("scryfall_id") or "")),
+            **pick_images(bp, gt, hd, pa, scryfall is not None),
         }
     if skipped:
         log(f"  (ignorati {skipped} articoli non singoli)")
@@ -769,7 +858,23 @@ def main():
     if not cache.data["expansions"]:
         log("CardTrader: scarico l'elenco delle espansioni…")
         cache.load_expansions()
-    items = build_items(ct, cache, markup, min_price, only_singles, Scryfall() if hd_images else None)
+    items = build_items(ct, cache, markup, min_price, only_singles,
+                        Scryfall() if hd_images else None, PiltoverArchive() if hd_images else None)
+
+    def hd_available(it):
+        """Controlla (una volta sola) che l'immagine HD esista davvero."""
+        if not it["hd"]:
+            return False
+        if it["trusted"]:
+            return True
+        u = it["images"][0]
+        if u in cache.data["bad_urls"]:
+            return False
+        if url_ok(u):
+            return True
+        cache.data["bad_urls"][u] = 1
+        log(f"  (immagine HD non disponibile, tengo quella CardTrader: {u})")
+        return False
     cache.save()
     existing = sh.synced_products(location_id)
     log(f"CardTrader: {len(items)} articoli · Shopify: {len(existing)} prodotti già sincronizzati")
@@ -787,8 +892,10 @@ def main():
                     continue
                 log(f"+ Nuovo: {it['title']} — {it['qty']} pz a € {it['price']:.2f}")
                 if not DRY_RUN:
-                    if it["hd"]:
+                    if hd_available(it):
                         it = dict(it, tags=it["tags"] + [HD_TAG])
+                    else:
+                        it = dict(it, images=it["fallback"])
                     sh.create_product(it, location_id, publication_id)
                 created += 1
                 continue
@@ -802,10 +909,10 @@ def main():
                 if not DRY_RUN:
                     sh.set_quantity(ex["inventory_item_id"], location_id, it["qty"], ex["qty"])
                 updated_qty += 1
-            if it["hd"] and HD_TAG not in ex["tags"]:
+            if it["hd"] and HD_TAG not in ex["tags"] and it["images"][0] not in cache.data["bad_urls"]:
                 if img_done >= max_img:
                     img_pending += 1
-                else:
+                elif hd_available(it):
                     log(f"🖼 Immagine HD: {it['title']}")
                     if not DRY_RUN:
                         sh.replace_images(ex["product_id"], ex["media_ids"], it["images"], it["title"])
@@ -832,6 +939,7 @@ def main():
     )
     if pending_new:
         log(f"(altre {pending_new} carte nuove verranno create nei prossimi giri, {max_create} alla volta)")
+    cache.save()
     if img_pending:
         log(f"(altre {img_pending} immagini HD verranno sostituite nei prossimi giri, {max_img} alla volta)")
     if errors:
