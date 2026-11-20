@@ -31,6 +31,7 @@ Variabili d'ambiente
 """
 
 import json
+import uuid
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -518,7 +519,7 @@ class Shopify:
         q["changeFromQuantity"] = current if current is not None else None
         d = self.gql(
             """mutation($input: InventorySetQuantitiesInput!) {
-                 inventorySetQuantities(input: $input) { userErrors { field message code } } }""",
+                 inventorySetQuantities(input: $input) @idempotent(key: "%s") { userErrors { field message code } } }""" % uuid.uuid4(),
             {"input": {"name": "available", "reason": "correction", "quantities": [q]}},
         )
         errs = d["inventorySetQuantities"]["userErrors"]
