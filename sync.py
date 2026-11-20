@@ -634,8 +634,19 @@ def foil_options(editable):
     return "nonfoil"
 
 
-def catalog_key(blueprint_id, foil):
-    return f"{blueprint_id}-{'f' if foil else 'n'}"
+def catalog_key(blueprint_id, foil, options):
+    """Chiave di una versione: foil/non foil separate solo se il blueprint le prevede entrambe."""
+    if options == "both":
+        return f"{blueprint_id}-{'f' if foil else 'n'}"
+    return f"{blueprint_id}-x"
+
+
+def fixed_foil(fixed):
+    """Foil fisso dalle proprietà fisse del blueprint (True/False), None se non indicato."""
+    for k, v in (fixed or {}).items():
+        if "foil" in k.lower() and isinstance(v, bool):
+            return v
+    return None
 
 
 class BlueprintCache:
@@ -694,7 +705,7 @@ class BlueprintCache:
                 "rarity": find_rarity(b.get("fixed_properties")) or "",
                 "category_id": b.get("category_id"),
                 "foil": foil_options(b.get("editable_properties")),
-                "props": sorted({(x.get("name") or "") for x in (b.get("editable_properties") or [])}),
+                "fixed_foil": fixed_foil(b.get("fixed_properties")),
             }
 
     def prefetch(self, blueprint_ids):
@@ -898,7 +909,7 @@ def build_items(ct, cache, markup, min_price, only_singles, scryfall=None, pilto
             desc += f"<p>{p['description']}</p>"
         desc += "<p>Controllata da me, spedita in bustina + toploader.</p>"
 
-        bp_key = catalog_key(p.get("blueprint_id"), foil) if p.get("blueprint_id") else ""
+        bp_key = catalog_key(p.get("blueprint_id"), foil, bp.get("foil")) if p.get("blueprint_id") else ""
         items[ct_id] = {
             "ct_id": ct_id,
             "bp_key": bp_key,
@@ -937,7 +948,9 @@ def build_catalog(ct, cache, game_keyword, piltover=None, refresh_hours=24):
         cache.load_expansions()
     exp_ids = sorted(eid for eid, e in cache.data["expansions"].items() if int(e.get("game_id") or 0) in game_ids)
     last = float(cache.data["catalog_at"].get(game_keyword) or 0)
-    if time.time() - last > refresh_hours * 3600:
+    stale = any("fixed_foil" not in bp for bp in cache.data["blueprints"].values()
+                if int(bp.get("game_id") or 0) in game_ids)
+    if stale or time.time() - last > refresh_hours * 3600:
         log(f"Catalogo {game_keyword}: aggiorno le schede di {len(exp_ids)} espansioni…")
         cache.load_expansions()
         exp_ids = sorted(eid for eid, e in cache.data["expansions"].items() if int(e.get("game_id") or 0) in game_ids)
@@ -953,9 +966,6 @@ def build_catalog(ct, cache, game_keyword, piltover=None, refresh_hours=24):
         need = {cm for bp in bps.values() for cm in (bp.get("cm_ids") or [])}
         pa = cache.piltover_images(piltover, need) if need else {}
     game_name = next(iter(games[g] for g in game_ids))
-    from collections import Counter
-    log(f"  versioni foil: {dict(Counter(bp.get('foil') or 'nonfoil' for bp in bps.values()))} · "
-        f"proprietà: {sorted({n for bp in bps.values() for n in (bp.get('props') or [])})}")
     out = {}
     for bid, bp in bps.items():
         exp = cache.data["expansions"].get(str(bp.get("expansion_id"))) or {}
@@ -964,8 +974,14 @@ def build_catalog(ct, cache, game_keyword, piltover=None, refresh_hours=24):
             name += f" ({bp['version']})"
         opts = bp.get("foil") or "nonfoil"
         rarity = bp.get("rarity") or ""
-        for foil in ([False] if opts == "nonfoil" else [True] if opts == "foil" else [False, True]):
-            key = catalog_key(bid, foil)
+        if opts == "both":
+            versions = [False, True]
+        elif opts == "foil":
+            versions = [True]
+        else:
+            versions = [bp.get("fixed_foil")]  # una sola versione: foil fisso, non foil o non indicato (None)
+        for foil in versions:
+            key = catalog_key(bid, foil, opts)
             title = name + (" · " + exp["name"] if exp.get("name") else "") + (" (Foil)" if foil else "")
             tags = [SYNC_TAG, CATALOG_TAG, "singola", game_keyword]
             if exp.get("code"):
@@ -974,7 +990,7 @@ def build_catalog(ct, cache, game_keyword, piltover=None, refresh_hours=24):
                 tags.append("foil")
             rows = [("Gioco", game_name),
                     ("Espansione", f"{exp.get('name')} ({(exp.get('code') or '').upper()})" if exp.get("name") else None),
-                    ("Foil", "Sì" if foil else "No")]
+                    ("Foil", None if foil is None else ("Sì" if foil else "No"))]
             desc = ("<ul>" + "".join(f"<li><strong>{k}:</strong> {v}</li>" for k, v in rows if v) + "</ul>"
                     "<p>Al momento non ce l'ho in vetrina. Scrivimi se la cerchi: te la trovo io.</p>")
             imgs = pick_images(bp, game_keyword, {}, pa, True)
@@ -992,7 +1008,7 @@ def build_catalog(ct, cache, game_keyword, piltover=None, refresh_hours=24):
                 "mf": {k: v for k, v in {
                     "espansione": exp.get("name") or "",
                     "rarita": RARITY_IT.get(rarity.lower(), rarity),
-                    "foil": "Sì" if foil else "No",
+                    "foil": "" if foil is None else ("Sì" if foil else "No"),
                     "bp": key,
                 }.items() if v},
                 **imgs,
@@ -1206,12 +1222,6 @@ def main():
             todo = [it for key, it in sorted(catalog.items())
                     if key not in real_keys and (CATALOG_SKU + key) not in placeholders]
             log(f"Catalogo {g}: {len(catalog)} versioni · {len(set(catalog) & real_keys)} già in vetrina · {len(todo)} da aggiungere")
-            if not set(catalog) & real_keys:
-                for it in items.values():
-                    if g in it["tags"] and it.get("bp_key"):
-                        b = cache.data["blueprints"].get(it["bp_key"].split("-")[0]) or {}
-                        log(f"  (vera {it['bp_key']}: in catalogo={it['bp_key'] in catalog} · categoria={b.get('category_id')} · "
-                            f"foil={b.get('foil')} · espansione={b.get('expansion_id')} · gioco={b.get('game_id')})")
             for it in todo:
                 if cat_created >= max_catalog:
                     cat_pending += 1
