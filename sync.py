@@ -49,6 +49,10 @@ ORDER_DONE_TAG = "ct-synced"
 HD_TAG = "img-hd"
 CATALOG_TAG = "catalogo"  # carte del catalogo completo, mai avute in magazzino: esaurite e senza prezzo
 CATALOG_SKU = "BP-"  # SKU dei segnaposto: CT-BP-<blueprint>-<f|n>
+GROUP_TAG = "gruppo-carta"  # una scheda per carta, con versioni, condizioni e lingue come varianti
+GROUP_OPTIONS = ["Versione", "Condizione", "Lingua"]
+VERSION_IT = {"standard": "Normale", "": "Normale", "alt art": "Alt Art", "alternate art": "Alt Art",
+              "overnumbered": "Overnumbered", "signed": "Firmata", "promo": "Promo", "showcase": "Showcase"}
 MF_NS = "carta"  # campi per i filtri del negozio: espansione, rarita, lingua, condizione, foil
 
 RARITY_IT = {
@@ -242,17 +246,23 @@ class PiltoverArchive:
 
     def all_images(self):
         """Mappa id Cardmarket -> url immagine, per tutte le stampe Riftbound."""
-        out, page = {}, 1
+        return self.all_cards()[0]
+
+    def all_cards(self):
+        """(id Cardmarket -> url immagine, id Cardmarket -> [numero, versione]) per tutte le stampe Riftbound."""
+        out, info, page = {}, {}, 1
         while True:
             d = http_json("GET", f"{PILTOVER_API}/cards?page={page}&limit=100", {"User-Agent": BROWSER_UA})
             for v in d.get("data") or []:
                 if v.get("cardmarketId") and v.get("imageUrl"):
                     out[str(v["cardmarketId"])] = v["imageUrl"]
+                if v.get("cardmarketId"):
+                    info[str(v["cardmarketId"])] = [v.get("variantNumber") or "", v.get("variantLabel") or v.get("variantType") or ""]
             if not (d.get("pagination") or {}).get("hasNext"):
                 break
             page += 1
             time.sleep(0.5)
-        return out
+        return out, info
 
 
 def ct_full_image(url):
@@ -351,7 +361,7 @@ class Shopify:
         """Mappa ct_product_id -> info del prodotto Shopify."""
         q = """
         query($after: String, $loc: ID!) {
-          products(first: 100, after: $after, query: "tag:%s") {
+          products(first: 100, after: $after, query: "tag:%s -tag:gruppo-carta") {
             pageInfo { hasNextPage endCursor }
             nodes {
               id title status tags
@@ -490,6 +500,161 @@ class Shopify:
         )
         if d["metafieldsSet"]["userErrors"]:
             raise RuntimeError(f"metafieldsSet negozio: {d['metafieldsSet']['userErrors']}")
+
+    # --- Schede raggruppate (una scheda per carta, versioni/condizioni/lingue come varianti) ---
+    def grouped_products(self, location_id):
+        """Mappa chiave gruppo -> scheda raggruppata, con le varianti per SKU."""
+        q = """
+        query($after: String, $loc: ID!) {
+          products(first: 50, after: $after, query: "tag:%s") {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id title tags
+              gruppo: metafield(namespace: "%s", key: "gruppo") { value }
+              media(first: 30) { nodes { id alt } }
+              variants(first: 100) { nodes {
+                id sku price
+                selectedOptions { name value }
+                bp: metafield(namespace: "%s", key: "bp") { value }
+                inventoryItem { id inventoryLevel(locationId: $loc) { quantities(names: ["available"]) { quantity } } }
+              } }
+            }
+          }
+        }""" % (GROUP_TAG, MF_NS, MF_NS)
+        out, after = {}, None
+        while True:
+            d = self.gql(q, {"after": after, "loc": location_id})
+            conn = d["products"]
+            for p in conn["nodes"]:
+                key = (p.get("gruppo") or {}).get("value")
+                if not key:
+                    continue
+                variants = {}
+                for v in p["variants"]["nodes"]:
+                    lvl = (v.get("inventoryItem") or {}).get("inventoryLevel")
+                    qty = lvl["quantities"][0]["quantity"] if lvl and lvl.get("quantities") else None
+                    variants[(v.get("sku") or "").strip()] = {
+                        "id": v["id"], "price": float(v["price"]), "qty": qty,
+                        "inventory_item_id": (v.get("inventoryItem") or {}).get("id"),
+                        "bp": (v.get("bp") or {}).get("value") or "",
+                        "options": {o["name"]: o["value"] for o in v.get("selectedOptions") or []},
+                    }
+                out[key] = {"product_id": p["id"], "title": p["title"], "tags": p.get("tags") or [],
+                            "media": {(m.get("alt") or ""): m["id"] for m in (p.get("media") or {}).get("nodes") or []},
+                            "variants": variants}
+            if not conn["pageInfo"]["hasNextPage"]:
+                break
+            after = conn["pageInfo"]["endCursor"]
+        return out
+
+    @staticmethod
+    def _variant_input(v, location_id, for_set):
+        out = {
+            "optionValues": [{"optionName": n, "name": v["options"][n]} for n in GROUP_OPTIONS],
+            "price": f"{v['price']:.2f}",
+            "inventoryPolicy": "DENY",
+            "inventoryItem": {"tracked": True, "sku": v["sku"]} if not for_set else {"tracked": True},
+            "metafields": [{"namespace": MF_NS, "key": "bp", "type": "single_line_text_field", "value": v["bp"] or "-"}],
+        }
+        if for_set:
+            out["sku"] = v["sku"]
+            out["inventoryQuantities"] = [{"locationId": location_id, "name": "available", "quantity": v["qty"]}]
+        else:
+            out["inventoryQuantities"] = [{"locationId": location_id, "availableQuantity": v["qty"]}]
+        return out
+
+    def create_group(self, g, location_id, publication_id):
+        variants, files, seen = [], [], set()
+        for v in g["variants"]:
+            vi = self._variant_input(v, location_id, True)
+            if v.get("image"):
+                alt = v["options"]["Versione"]
+                if alt not in seen:
+                    seen.add(alt)
+                    files.append({"originalSource": v["image"], "contentType": "IMAGE", "alt": alt})
+                vi["file"] = {"originalSource": v["image"], "contentType": "IMAGE", "alt": alt}
+            variants.append(vi)
+        opts = []
+        for n in GROUP_OPTIONS:
+            vals = []
+            for v in g["variants"]:
+                if v["options"][n] not in vals:
+                    vals.append(v["options"][n])
+            opts.append({"name": n, "values": [{"name": x} for x in vals]})
+        inp = {
+            "title": g["title"], "handle": g["handle"], "descriptionHtml": g["description"],
+            "vendor": g["game_name"] or "Pentolhaus", "productType": "Singola", "status": "ACTIVE",
+            "tags": g["tags"], "productOptions": opts, "variants": variants,
+            "metafields": [{"namespace": MF_NS, "key": k, "type": "single_line_text_field", "value": v}
+                           for k, v in g["mf"].items()],
+        }
+        if files:
+            inp["files"] = files
+        d = self.gql("""mutation($input: ProductSetInput!) {
+                 productSet(input: $input, synchronous: true) { product { id } userErrors { field message } } }""",
+                     {"input": inp})
+        res = d["productSet"]
+        if res["userErrors"]:
+            raise RuntimeError(f"productSet: {res['userErrors']}")
+        pid = res["product"]["id"]
+        if publication_id:
+            self.gql("""mutation($id: ID!, $pub: ID!) {
+                 publishablePublish(id: $id, input: [{publicationId: $pub}]) { userErrors { message } } }""",
+                     {"id": pid, "pub": publication_id})
+        return pid
+
+    def add_group_variants(self, product_id, new_variants, media_by_alt, location_id):
+        media, variants = [], []
+        added = set()
+        for v in new_variants:
+            vi = self._variant_input(v, location_id, False)
+            alt = v["options"]["Versione"]
+            if media_by_alt.get(alt):
+                vi["mediaId"] = media_by_alt[alt]
+            elif v.get("image"):
+                if alt not in added:
+                    media.append({"originalSource": v["image"], "mediaContentType": "IMAGE", "alt": alt})
+                    added.add(alt)
+                vi["mediaSrc"] = [v["image"]]
+            variants.append(vi)
+        d = self.gql("""mutation($pid: ID!, $v: [ProductVariantsBulkInput!]!, $m: [CreateMediaInput!]) {
+                 productVariantsBulkCreate(productId: $pid, variants: $v, media: $m) { userErrors { field message } } }""",
+                     {"pid": product_id, "v": variants, "m": media or None})
+        errs = d["productVariantsBulkCreate"]["userErrors"]
+        if errs:
+            raise RuntimeError(f"productVariantsBulkCreate: {errs}")
+
+    def delete_group_variants(self, product_id, variant_ids):
+        d = self.gql("""mutation($pid: ID!, $ids: [ID!]!) {
+                 productVariantsBulkDelete(productId: $pid, variantsIds: $ids) { userErrors { field message } } }""",
+                     {"pid": product_id, "ids": variant_ids})
+        errs = d["productVariantsBulkDelete"]["userErrors"]
+        if errs:
+            raise RuntimeError(f"productVariantsBulkDelete: {errs}")
+
+    def set_tags(self, product_id, add=None, remove=None):
+        if add:
+            self.gql("mutation($id: ID!, $t: [String!]!) { tagsAdd(id: $id, tags: $t) { userErrors { message } } }",
+                     {"id": product_id, "t": add})
+        if remove:
+            self.gql("mutation($id: ID!, $t: [String!]!) { tagsRemove(id: $id, tags: $t) { userErrors { message } } }",
+                     {"id": product_id, "t": remove})
+
+    def legacy_products(self, game_tag_name):
+        """Schede vecchie (una per copia) di un gioco ora raggruppato: id e SKU."""
+        q = """query($after: String) { products(first: 100, after: $after, query: "tag:%s tag:%s -tag:%s") {
+                 pageInfo { hasNextPage endCursor } nodes { id variants(first: 1) { nodes { sku } } } } }""" % (
+            SYNC_TAG, game_tag_name, GROUP_TAG)
+        out, after = [], None
+        while True:
+            d = self.gql(q, {"after": after})
+            for p in d["products"]["nodes"]:
+                vs = p["variants"]["nodes"]
+                out.append((p["id"], (vs[0].get("sku") if vs else "") or ""))
+            if not d["products"]["pageInfo"]["hasNextPage"]:
+                break
+            after = d["products"]["pageInfo"]["endCursor"]
+        return out
 
     def delete_product(self, product_id):
         d = self.gql(
@@ -665,6 +830,7 @@ class BlueprintCache:
         self.data.setdefault("scryfall", {})
         self.data.setdefault("piltover", {})
         self.data.setdefault("piltover_at", 0)
+        self.data.setdefault("piltover_info", {})
         self.data.setdefault("bad_urls", {})
         self.data.setdefault("catalog_at", {})
         self._loaded_exp = set()
@@ -677,6 +843,7 @@ class BlueprintCache:
         snapshot = {"blueprints": self.data["blueprints"].copy(), "expansions": self.data["expansions"].copy(),
                     "scryfall": self.data["scryfall"].copy(), "piltover": self.data["piltover"].copy(),
                     "piltover_at": self.data["piltover_at"], "bad_urls": self.data["bad_urls"].copy(),
+                    "piltover_info": self.data["piltover_info"].copy(),
                     "catalog_at": self.data["catalog_at"].copy()}
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(snapshot, f)
@@ -759,10 +926,10 @@ class BlueprintCache:
         """Mappa id Cardmarket -> url Piltover Archive; riscarica se vecchia di 7 giorni o se mancano carte (max 1 volta ogni 6 ore)."""
         age = time.time() - float(self.data.get("piltover_at") or 0)
         missing = [i for i in need_ids if i not in self.data["piltover"]]
-        if age > 7 * 86400 or (missing and age > 6 * 3600):
+        if age > 7 * 86400 or (missing and age > 6 * 3600) or not self.data.get("piltover_info"):
             log(f"Piltover Archive: scarico l'elenco delle carte Riftbound…")
             try:
-                self.data["piltover"] = piltover.all_images()
+                self.data["piltover"], self.data["piltover_info"] = piltover.all_cards()
                 self.data["piltover_at"] = time.time()
                 log(f"  {len(self.data['piltover'])} stampe trovate")
             except Exception as e:
@@ -913,6 +1080,11 @@ def build_items(ct, cache, markup, min_price, only_singles, scryfall=None, pilto
         items[ct_id] = {
             "ct_id": ct_id,
             "bp_key": bp_key,
+            "bp_id": str(p.get("blueprint_id") or ""),
+            "name": name,
+            "foil": foil,
+            "cond_short": cond_short or "",
+            "lang": lang or "",
             "title": title[:255],
             "qty": max(qty, 0),
             "price": price,
@@ -999,6 +1171,9 @@ def build_catalog(ct, cache, game_keyword, piltover=None, refresh_hours=24):
             out[key] = {
                 "ct_id": CATALOG_SKU + key,
                 "bp_key": key,
+                "bp_id": str(bid),
+                "foil": foil,
+                "name": bp.get("name") or f"Carta {bid}",
                 "title": title[:255],
                 "qty": 0,
                 "price": 0.0,
@@ -1013,6 +1188,127 @@ def build_catalog(ct, cache, game_keyword, piltover=None, refresh_hours=24):
                 }.items() if v},
                 **imgs,
             }
+    return out
+
+
+def version_info(bp, cache):
+    """(numero di collezione, nome della versione) di un blueprint, da Piltover Archive."""
+    info = cache.data.get("piltover_info") or {}
+    num, label = "", ""
+    for cm in bp.get("cm_ids") or []:
+        if cm in info:
+            num, label = info[cm][0] or "", info[cm][1] or ""
+            break
+    if not label:
+        label = bp.get("version") or ""
+    return num, VERSION_IT.get(label.lower(), label) or "Normale"
+
+
+def num_sort_key(num):
+    import re
+    m = re.match(r"([A-Za-z-]*?)-?(\d+)(.*)", num or "")
+    return (m.group(1), int(m.group(2)), m.group(3)) if m else ("~", 10 ** 6, num or "")
+
+
+def build_groups(game_keyword, real_items, catalog, existing, cache):
+    """Le schede raggruppate desiderate: {chiave gruppo: scheda con varianti}.
+    real_items: copie vere da CardTrader (qty > 0); catalog: tutte le versioni del gioco;
+    existing: schede raggruppate già su Shopify (per tenere le copie vendute a 0)."""
+    bps = cache.data["blueprints"]
+    groups = {}
+
+    def group_for(bp_id):
+        bp = bps.get(str(bp_id)) or {}
+        exp = cache.data["expansions"].get(str(bp.get("expansion_id"))) or {}
+        name = bp.get("name") or f"Carta {bp_id}"
+        key = f"{bp.get('expansion_id')}:{name.lower()}"
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = {"key": key, "name": name, "exp": exp, "bps": {}, "variants": [], "rarities": set()}
+        g["bps"][str(bp_id)] = bp
+        if bp.get("rarity"):
+            g["rarities"].add(bp["rarity"])
+        return g
+
+    cat_by_key = dict(catalog)
+    real_keys = set()
+    for it in real_items:
+        if not it.get("bp_id"):
+            continue
+        g = group_for(it["bp_id"])
+        cimg = (cat_by_key.get(it["bp_key"]) or {}).get("images") or []
+        g["variants"].append({"sku": SKU_PREFIX + it["ct_id"], "bp": it["bp_key"], "bp_id": it["bp_id"], "foil": it["foil"],
+                              "cond": it.get("cond_short") or "—",
+                              "lang": LANG_IT.get((it.get("lang") or "").lower(), (it.get("lang") or "").upper()) or "—",
+                              "price": it["price"], "qty": it["qty"], "image": (cimg or it.get("images") or [None])[0],
+                              "real": True})
+        real_keys.add(it["bp_key"])
+    have = {v["sku"] for g in groups.values() for v in g["variants"]}
+    for ex in existing.values():
+        for sku, v in ex["variants"].items():
+            if sku.startswith(SKU_PREFIX) and not sku[len(SKU_PREFIX):].startswith(CATALOG_SKU) and sku not in have:
+                bp_id = (v.get("bp") or "").split("-")[0]
+                if not bp_id or bp_id not in bps:
+                    continue
+                g = group_for(bp_id)
+                o = v["options"]
+                cimg = (cat_by_key.get(v["bp"]) or {}).get("images") or []
+                g["variants"].append({"sku": sku, "bp": v["bp"], "bp_id": bp_id, "foil": o.get("Versione", "").endswith(" Foil"),
+                                      "cond": o.get("Condizione", "—"), "lang": o.get("Lingua", "—"), "price": v["price"],
+                                      "qty": 0, "image": (cimg or [None])[0], "real": True, "keep_label": o.get("Versione")})
+                real_keys.add(v["bp"])
+    for key, it in catalog.items():
+        if key in real_keys:
+            continue
+        g = group_for(it["bp_id"])
+        g["variants"].append({"sku": SKU_PREFIX + CATALOG_SKU + key, "bp": key, "bp_id": it["bp_id"], "foil": it["foil"],
+                              "cond": "—", "lang": "—", "price": 0.0, "qty": 0,
+                              "image": (it.get("images") or [None])[0], "real": False})
+
+    out = {}
+    for key, g in groups.items():
+        info = {bid: version_info(bp, cache) for bid, bp in g["bps"].items()}
+        labels = {}
+        for bid, (num, label) in info.items():
+            labels.setdefault(label, []).append(bid)
+        def vlabel(bid, foil):
+            num, label = info[bid]
+            if len(labels.get(label, [])) > 1 and num:
+                label = f"{label} {num}"
+            return label + (" Foil" if foil else "")
+        nums = sorted((n for n, _ in info.values() if n), key=num_sort_key)
+        base = next((info[b][0] for b in sorted(info, key=lambda b: num_sort_key(info[b][0]))
+                     if info[b][1] == "Normale" and info[b][0]), nums[0] if nums else "")
+        seen = set()
+        variants = []
+        order = sorted(g["variants"], key=lambda v: (num_sort_key(info[v["bp_id"]][0]), bool(v["foil"]), not v["real"], v["cond"], v["lang"]))
+        for v in order:
+            label = v.get("keep_label") or vlabel(v["bp_id"], v["foil"])
+            cond = v["cond"]
+            n = 2
+            while (label, cond, v["lang"]) in seen:
+                cond = f"{v['cond']} ·{n}"
+                n += 1
+            seen.add((label, cond, v["lang"]))
+            variants.append(dict(v, options={"Versione": label, "Condizione": cond, "Lingua": v["lang"]}))
+        exp = g["exp"]
+        title = (f"{base} · " if base else "") + g["name"]
+        rarity = sorted(g["rarities"])[0] if g["rarities"] else ""
+        tags = [SYNC_TAG, GROUP_TAG, "singola", game_keyword]
+        if exp.get("code"):
+            tags.append("espansione-" + slug(exp["code"]))
+        rows = [("Espansione", f"{exp.get('name')} ({(exp.get('code') or '').upper()})" if exp.get("name") else None),
+                ("Numero", base or None)]
+        desc = ("<ul>" + "".join(f"<li><strong>{k}:</strong> {v}</li>" for k, v in rows if v) + "</ul>"
+                "<p>Scegli la versione qui sopra. Ogni copia è controllata da me e spedita in bustina + toploader. "
+                "Se una versione è esaurita scrivimi: te la trovo io.</p>")
+        out[key] = {
+            "key": key, "title": title[:255], "handle": slug(f"{game_keyword} {exp.get('code') or ''} {title}")[:250],
+            "description": desc, "tags": tags, "game_name": None, "sort": (exp.get("code") or "", num_sort_key(base)),
+            "mf": {k: v for k, v in {"gruppo": key, "espansione": exp.get("name") or "",
+                                     "rarita": RARITY_IT.get(rarity.lower(), rarity), "numero": base}.items() if v},
+            "variants": variants,
+        }
     return out
 
 
@@ -1037,6 +1333,9 @@ def main():
     max_img = int(env_float("MAX_IMAGE_UPDATES", 300))
     catalog_games = [g.strip().lower() for g in os.environ.get("CATALOG_GAMES", "riftbound").split(",") if g.strip()]
     max_catalog = int(env_float("MAX_CATALOG_CREATE", 300))
+    grouped_games = [g.strip().lower() for g in os.environ.get("GROUPED_GAMES", "riftbound").split(",") if g.strip()]
+    catalog_games = [g for g in catalog_games if g not in grouped_games]
+    max_legacy_delete = int(env_float("MAX_LEGACY_DELETE", 600))
 
     log(f"=== Sync CardTrader → Shopify {'(PROVA: nessuna modifica)' if DRY_RUN else '(MODIFICHE ATTIVE)'} ===")
     ct = CardTrader(ct_token)
@@ -1102,6 +1401,9 @@ def main():
         log(f"  (immagine HD non disponibile, tengo quella CardTrader: {u})")
         return False
     cache.save()
+    all_items = items
+    grouped_items = {g: [it for it in items.values() if g in it["tags"]] for g in grouped_games}
+    items = {k: it for k, it in items.items() if not any(g in it["tags"] for g in grouped_games)}
     existing = sh.synced_products(location_id)
     placeholders = {k: v for k, v in existing.items() if k.startswith(CATALOG_SKU)}
     existing = {k: v for k, v in existing.items() if not k.startswith(CATALOG_SKU)}
@@ -1165,7 +1467,7 @@ def main():
                 log(f"! Errore sui filtri: {e}")
 
     for ct_id, ex in existing.items():
-        if ct_id in items or not ex["qty"]:
+        if ct_id in items or not ex["qty"] or any(g in ex["tags"] for g in grouped_games):
             continue
         try:
             log(f"0 Esaurito su CardTrader: {ex['title']} ({ex['qty']} → 0)")
@@ -1178,7 +1480,7 @@ def main():
 
     # Riepilogo dei pezzi disponibili per gioco ed espansione (il tema lo usa nelle vetrine)
     counts = {"giochi": {}, "espansioni": {}}
-    for it in items.values():
+    for it in all_items.values():
         if it["qty"] <= 0:
             continue
         g = next((t for t in it["tags"] if t in ("magic", "pokemon", "riftbound")), None) or game_tag(it["game_name"]) or "altro"
@@ -1240,6 +1542,85 @@ def main():
         if cat_created:
             log(f"📚 Catalogo: aggiunte {cat_created} carte esaurite")
 
+    # 4) Giochi raggruppati: una scheda per carta, con versioni, condizioni e lingue come varianti
+    g_created = g_changed = g_deleted = g_pending = 0
+    for g in grouped_games:
+        try:
+            catalog = build_catalog(ct, cache, g, PiltoverArchive() if hd_images else None)
+            ex_groups = sh.grouped_products(location_id)
+            groups = build_groups(g, grouped_items.get(g, []), catalog, ex_groups, cache)
+        except Exception as e:
+            errors += 1
+            log(f"! Schede raggruppate {g}: {e}")
+            continue
+        log(f"Schede {g}: {len(groups)} carte · {sum(len(x['variants']) for x in groups.values())} versioni/copie · "
+            f"{len(ex_groups)} già su Shopify")
+        for key in sorted(groups, key=lambda k: groups[k]["sort"]):
+            want = groups[key]
+            have = ex_groups.get(key)
+            try:
+                if not have:
+                    if g_created >= max_catalog:
+                        g_pending += 1
+                        continue
+                    if not DRY_RUN:
+                        sh.create_group(dict(want, game_name=next((it["game_name"] for it in catalog.values()), None)),
+                                        location_id, publication_id)
+                    g_created += 1
+                    continue
+                want_v = {v["sku"]: v for v in want["variants"]}
+                new = [v for sku, v in want_v.items() if sku not in have["variants"]]
+                gone = [x["id"] for sku, x in have["variants"].items() if sku not in want_v]
+                touched = False
+                if new:
+                    log(f"+ {want['title']}: {len(new)} versioni/copie nuove")
+                    if not DRY_RUN:
+                        sh.add_group_variants(have["product_id"], new, have["media"], location_id)
+                    touched = True
+                if gone:
+                    if not DRY_RUN:
+                        sh.delete_group_variants(have["product_id"], gone)
+                    touched = True
+                for sku, v in want_v.items():
+                    hv = have["variants"].get(sku)
+                    if not hv:
+                        continue
+                    if v["real"] and abs(hv["price"] - v["price"]) >= 0.005:
+                        log(f"€ Prezzo: {want['title']} ({v['options']['Versione']}): {hv['price']:.2f} → {v['price']:.2f}")
+                        if not DRY_RUN:
+                            sh.update_price(have["product_id"], hv["id"], v["price"])
+                        touched = True
+                    if hv["qty"] != v["qty"]:
+                        log(f"# Quantità: {want['title']} ({v['options']['Versione']}): {hv['qty']} → {v['qty']}")
+                        if not DRY_RUN:
+                            sh.set_quantity(hv["inventory_item_id"], location_id, v["qty"], hv["qty"])
+                        touched = True
+                g_changed += int(touched)
+            except Exception as e:
+                errors += 1
+                log(f"! Errore sulla scheda {want['title']}: {e}")
+        if g_created:
+            log(f"🃏 Schede {g}: create {g_created} carte raggruppate")
+        # Le vecchie schede (una per copia) spariscono quando la loro copia è già nella scheda raggruppata
+        if not g_pending:
+            try:
+                in_groups = {v["sku"] for x in groups.values() for v in x["variants"]}
+                if not DRY_RUN:
+                    in_groups |= {sku for x in sh.grouped_products(location_id).values() for sku in x["variants"]}
+                legacy = sh.legacy_products(g)
+                sold_out = {SKU_PREFIX + cid for cid, ex in existing.items() if not ex["qty"] and g in ex["tags"]}
+                todo = [(pid, sku) for pid, sku in legacy
+                        if sku in in_groups or sku in sold_out or sku[len(SKU_PREFIX):].startswith(CATALOG_SKU)]
+                if todo:
+                    log(f"- Schede {g}: tolgo {min(len(todo), max_legacy_delete)} vecchie schede singole (su {len(todo)})")
+                for pid, sku in todo[:max_legacy_delete]:
+                    if not DRY_RUN:
+                        sh.delete_product(pid)
+                    g_deleted += 1
+            except Exception as e:
+                errors += 1
+                log(f"! Errore togliendo le vecchie schede {g}: {e}")
+
     log(
         f"=== Fatto: {done_orders} ordini Shopify riportati su CardTrader · {created} nuovi · "
         f"{updated_qty} quantità · {updated_price} prezzi · {img_done} immagini HD · "
@@ -1247,6 +1628,9 @@ def main():
     )
     if cat_pending:
         log(f"(altre {cat_pending} carte di catalogo verranno aggiunte nei prossimi giri, {max_catalog} alla volta)")
+    if g_created or g_changed or g_deleted or g_pending:
+        log(f"Schede raggruppate: {g_created} create · {g_changed} aggiornate · {g_deleted} vecchie tolte"
+            + (f" · altre {g_pending} nei prossimi giri" if g_pending else ""))
     if pending_new:
         log(f"(altre {pending_new} carte nuove verranno create nei prossimi giri, {max_create} alla volta)")
     cache.save()
