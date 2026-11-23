@@ -564,15 +564,15 @@ class Shopify:
         return out
 
     def create_group(self, g, location_id, publication_id):
-        variants, files, seen = [], [], set()
+        variants, files, seen = [], [], {}
         for v in g["variants"]:
             vi = self._variant_input(v, location_id, True)
             if v.get("image"):
-                alt = v["options"]["Versione"]
-                if alt not in seen:
-                    seen.add(alt)
-                    files.append({"originalSource": v["image"], "contentType": "IMAGE", "alt": alt})
-                vi["file"] = {"originalSource": v["image"], "contentType": "IMAGE", "alt": alt}
+                # la versione foil usa la stessa illustrazione della normale: una sola immagine per artwork
+                if v["image"] not in seen:
+                    seen[v["image"]] = {"originalSource": v["image"], "contentType": "IMAGE", "alt": base_label(v["options"]["Versione"])}
+                    files.append(seen[v["image"]])
+                vi["file"] = dict(seen[v["image"]])
             variants.append(vi)
         opts = []
         for n in GROUP_OPTIONS:
@@ -608,9 +608,9 @@ class Shopify:
         added = set()
         for v in new_variants:
             vi = self._variant_input(v, location_id, False)
-            alt = v["options"]["Versione"]
-            if media_by_alt.get(alt):
-                vi["mediaId"] = media_by_alt[alt]
+            alt = base_label(v["options"]["Versione"])
+            if media_by_alt.get(alt) or media_by_alt.get(v["options"]["Versione"]):
+                vi["mediaId"] = media_by_alt.get(alt) or media_by_alt.get(v["options"]["Versione"])
             elif v.get("image"):
                 if alt not in added:
                     media.append({"originalSource": v["image"], "mediaContentType": "IMAGE", "alt": alt})
@@ -623,6 +623,20 @@ class Shopify:
         errs = d["productVariantsBulkCreate"]["userErrors"]
         if errs:
             raise RuntimeError(f"productVariantsBulkCreate: {errs}")
+
+    def merge_foil_media(self, product_id, variant_media, drop_media_ids):
+        """Le varianti foil passano all'immagine della versione normale; l'immagine doppia viene tolta."""
+        if variant_media:
+            d = self.gql("""mutation($pid: ID!, $v: [ProductVariantsBulkInput!]!) {
+                     productVariantsBulkUpdate(productId: $pid, variants: $v) { userErrors { field message } } }""",
+                         {"pid": product_id, "v": [{"id": vid, "mediaId": mid} for vid, mid in variant_media]})
+            if d["productVariantsBulkUpdate"]["userErrors"]:
+                raise RuntimeError(f"immagini varianti: {d['productVariantsBulkUpdate']['userErrors']}")
+        if drop_media_ids:
+            d = self.gql("mutation($ids: [ID!]!) { fileDelete(fileIds: $ids) { userErrors { field message } } }",
+                         {"ids": drop_media_ids})
+            if d["fileDelete"]["userErrors"]:
+                raise RuntimeError(f"immagini doppie: {d['fileDelete']['userErrors']}")
 
     def delete_group_variants(self, product_id, variant_ids):
         d = self.gql("""mutation($pid: ID!, $ids: [ID!]!) {
@@ -1243,6 +1257,11 @@ def num_sort_key(num):
     return (m.group(1), int(m.group(2)), m.group(3)) if m else ("~", 10 ** 6, num or "")
 
 
+def base_label(label):
+    """'Normale Foil' -> 'Normale': la foil ha la stessa illustrazione della versione normale."""
+    return label[:-5] if (label or "").endswith(" Foil") else label
+
+
 def plan_moves(current, desired_first):
     """Spostamenti minimi perché la collezione inizi con desired_first (nell'ordine dato); il resto resta com'è."""
     want = [pid for pid in desired_first if pid in set(current)]
@@ -1390,6 +1409,7 @@ def main():
     max_legacy_delete = int(env_float("MAX_LEGACY_DELETE", 1200))
     set_order = [x.strip().upper() for x in os.environ.get("SET_ORDER", "OGN,OGS,SFD,UNL,VEN,RAD,ARC").split(",") if x.strip()]
     max_moves = int(env_float("MAX_REORDER_MOVES", 1000))
+    max_merge = int(env_float("MAX_MEDIA_MERGE", 400))
 
     log(f"=== Sync CardTrader → Shopify {'(PROVA: nessuna modifica)' if DRY_RUN else '(MODIFICHE ATTIVE)'} ===")
     ct = CardTrader(ct_token)
@@ -1597,7 +1617,7 @@ def main():
             log(f"📚 Catalogo: aggiunte {cat_created} carte esaurite")
 
     # 4) Giochi raggruppati: una scheda per carta, con versioni, condizioni e lingue come varianti
-    g_created = g_changed = g_deleted = g_pending = 0
+    g_created = g_changed = g_deleted = g_pending = g_merged = 0
     for g in grouped_games:
         try:
             catalog = build_catalog(ct, cache, g, PiltoverArchive() if hd_images else None)
@@ -1622,6 +1642,15 @@ def main():
                                         location_id, publication_id)
                     g_created += 1
                     continue
+                dupes = [a for a in have["media"] if a.endswith(" Foil") and base_label(a) in have["media"]]
+                if dupes and g_merged < max_merge:
+                    vm = [(hv["id"], have["media"][base_label(hv["options"].get("Versione", ""))])
+                          for hv in have["variants"].values() if hv["options"].get("Versione") in dupes]
+                    if not DRY_RUN:
+                        sh.merge_foil_media(have["product_id"], vm, [have["media"][a] for a in dupes])
+                    for a in dupes:
+                        have["media"].pop(a, None)
+                    g_merged += 1
                 want_v = {v["sku"]: v for v in want["variants"]}
                 new = [v for sku, v in want_v.items() if sku not in have["variants"]]
                 gone = [x["id"] for sku, x in have["variants"].items() if sku not in want_v]
@@ -1697,8 +1726,9 @@ def main():
     )
     if cat_pending:
         log(f"(altre {cat_pending} carte di catalogo verranno aggiunte nei prossimi giri, {max_catalog} alla volta)")
-    if g_created or g_changed or g_deleted or g_pending:
-        log(f"Schede raggruppate: {g_created} create · {g_changed} aggiornate · {g_deleted} vecchie tolte"
+    if g_created or g_changed or g_deleted or g_pending or g_merged:
+        log(f"Schede raggruppate: {g_created} create · {g_changed} aggiornate · {g_deleted} vecchie tolte · "
+            f"{g_merged} immagini doppie tolte"
             + (f" · altre {g_pending} nei prossimi giri" if g_pending else ""))
     if pending_new:
         log(f"(altre {pending_new} carte nuove verranno create nei prossimi giri, {max_create} alla volta)")
