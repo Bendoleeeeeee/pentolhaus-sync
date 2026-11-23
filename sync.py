@@ -1387,7 +1387,7 @@ def main():
     max_catalog = int(env_float("MAX_CATALOG_CREATE", 300))
     grouped_games = [g.strip().lower() for g in os.environ.get("GROUPED_GAMES", "riftbound").split(",") if g.strip()]
     catalog_games = [g for g in catalog_games if g not in grouped_games]
-    max_legacy_delete = int(env_float("MAX_LEGACY_DELETE", 600))
+    max_legacy_delete = int(env_float("MAX_LEGACY_DELETE", 1200))
     set_order = [x.strip().upper() for x in os.environ.get("SET_ORDER", "OGN,OGS,SFD,UNL,VEN,RAD,ARC").split(",") if x.strip()]
     max_moves = int(env_float("MAX_REORDER_MOVES", 1000))
 
@@ -1670,11 +1670,12 @@ def main():
             errors += 1
             log(f"! Errore riordinando la collezione {g}: {e}")
         # Le vecchie schede (una per copia) spariscono quando la loro copia è già nella scheda raggruppata
-        if not g_pending:
+        if True:  # i segnaposto vecchi si tolgono subito; le copie vere solo quando sono già nella scheda raggruppata
             try:
-                in_groups = {v["sku"] for x in groups.values() for v in x["variants"]}
-                if not DRY_RUN:
-                    in_groups |= {sku for x in sh.grouped_products(location_id).values() for sku in x["variants"]}
+                if DRY_RUN:
+                    in_groups = {v["sku"] for x in groups.values() for v in x["variants"]}
+                else:
+                    in_groups = {sku for x in sh.grouped_products(location_id).values() for sku in x["variants"]}
                 legacy = sh.legacy_products(g)
                 sold_out = {SKU_PREFIX + cid for cid, ex in existing.items() if not ex["qty"] and g in ex["tags"]}
                 todo = [(pid, sku) for pid, sku in legacy
