@@ -582,7 +582,7 @@ class Shopify:
                     vals.append(v["options"][n])
             opts.append({"name": n, "values": [{"name": x} for x in vals]})
         inp = {
-            "title": g["title"], "handle": g["handle"], "descriptionHtml": g["description"],
+            "title": g["title"], "descriptionHtml": g["description"],
             "vendor": g["game_name"] or "Pentolhaus", "productType": "Singola", "status": "ACTIVE",
             "tags": g["tags"], "productOptions": opts, "variants": variants,
             "metafields": [{"namespace": MF_NS, "key": k, "type": "single_line_text_field", "value": v}
