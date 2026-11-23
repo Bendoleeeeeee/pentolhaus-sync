@@ -656,6 +656,39 @@ class Shopify:
             after = d["products"]["pageInfo"]["endCursor"]
         return out
 
+    def collection_order(self, handle):
+        """(id collezione, tipo di ordinamento, id dei prodotti nell'ordine attuale)."""
+        q = """query($h: String!, $after: String) { collectionByHandle(handle: $h) { id sortOrder
+                 products(first: 250, after: $after, sortKey: COLLECTION_DEFAULT) { pageInfo { hasNextPage endCursor } nodes { id } } } }"""
+        ids, after, cid, order = [], None, None, None
+        while True:
+            d = self.gql(q, {"h": handle, "after": after})
+            c = d.get("collectionByHandle")
+            if not c:
+                return None, None, []
+            cid, order = c["id"], c["sortOrder"]
+            ids += [n["id"] for n in c["products"]["nodes"]]
+            if not c["products"]["pageInfo"]["hasNextPage"]:
+                break
+            after = c["products"]["pageInfo"]["endCursor"]
+        return cid, order, ids
+
+    def reorder_collection(self, collection_id, moves):
+        """Applica gli spostamenti (max 250 per chiamata), aspettando che ogni blocco sia finito."""
+        for i in range(0, len(moves), 250):
+            d = self.gql("""mutation($id: ID!, $m: [MoveInput!]!) { collectionReorderProducts(id: $id, moves: $m) {
+                     job { id done } userErrors { field message } } }""",
+                         {"id": collection_id, "m": [{"id": pid, "newPosition": str(pos)} for pid, pos in moves[i:i + 250]]})
+            res = d["collectionReorderProducts"]
+            if res["userErrors"]:
+                raise RuntimeError(f"collectionReorderProducts: {res['userErrors']}")
+            job = res.get("job") or {}
+            for _ in range(60):
+                if not job.get("id") or job.get("done"):
+                    break
+                time.sleep(1)
+                job = (self.gql("query($id: ID!) { job(id: $id) { id done } }", {"id": job["id"]}).get("job") or {})
+
     def delete_product(self, product_id):
         d = self.gql(
             "mutation($id: ID!) { productDelete(input: {id: $id}) { deletedProductId userErrors { message } } }",
@@ -1210,6 +1243,25 @@ def num_sort_key(num):
     return (m.group(1), int(m.group(2)), m.group(3)) if m else ("~", 10 ** 6, num or "")
 
 
+def plan_moves(current, desired_first):
+    """Spostamenti minimi perché la collezione inizi con desired_first (nell'ordine dato); il resto resta com'è."""
+    want = [pid for pid in desired_first if pid in set(current)]
+    rest = [pid for pid in current if pid not in set(want)]
+    target = want + rest
+    sim, moves = list(current), []
+    for i, pid in enumerate(target):
+        if sim[i] != pid:
+            sim.remove(pid)
+            sim.insert(i, pid)
+            moves.append((pid, i))
+    return moves
+
+
+def set_rank(code, order):
+    code = (code or "").upper()
+    return (order.index(code), "") if code in order else (len(order), code)
+
+
 def build_groups(game_keyword, real_items, catalog, existing, cache):
     """Le schede raggruppate desiderate: {chiave gruppo: scheda con varianti}.
     real_items: copie vere da CardTrader (qty > 0); catalog: tutte le versioni del gioco;
@@ -1336,6 +1388,8 @@ def main():
     grouped_games = [g.strip().lower() for g in os.environ.get("GROUPED_GAMES", "riftbound").split(",") if g.strip()]
     catalog_games = [g for g in catalog_games if g not in grouped_games]
     max_legacy_delete = int(env_float("MAX_LEGACY_DELETE", 600))
+    set_order = [x.strip().upper() for x in os.environ.get("SET_ORDER", "OGN,OGS,SFD,UNL,VEN,RAD,ARC").split(",") if x.strip()]
+    max_moves = int(env_float("MAX_REORDER_MOVES", 1000))
 
     log(f"=== Sync CardTrader → Shopify {'(PROVA: nessuna modifica)' if DRY_RUN else '(MODIFICHE ATTIVE)'} ===")
     ct = CardTrader(ct_token)
@@ -1601,6 +1655,20 @@ def main():
                 log(f"! Errore sulla scheda {want['title']}: {e}")
         if g_created:
             log(f"🃏 Schede {g}: create {g_created} carte raggruppate")
+        # Ordine della collezione: per set (dal primo uscito) e poi per numero di carta
+        try:
+            cid, sort_order, current = sh.collection_order(g)
+            if cid and sort_order == "MANUAL" and not DRY_RUN:
+                now = sh.grouped_products(location_id)
+                ranked = sorted((k for k in now if k in groups),
+                                key=lambda k: (set_rank(groups[k]["sort"][0], set_order), groups[k]["sort"][1]))
+                moves = plan_moves(current, [now[k]["product_id"] for k in ranked])
+                if moves:
+                    log(f"↕ Collezione {g}: riordino per set e numero ({min(len(moves), max_moves)} spostamenti su {len(moves)})")
+                    sh.reorder_collection(cid, moves[:max_moves])
+        except Exception as e:
+            errors += 1
+            log(f"! Errore riordinando la collezione {g}: {e}")
         # Le vecchie schede (una per copia) spariscono quando la loro copia è già nella scheda raggruppata
         if not g_pending:
             try:
